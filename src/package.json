@@ -1,0 +1,15 @@
+{
+  "name": "schedule-email-worker",
+  "version": "1.0.0",
+  "description": "Email worker for processing schedule Excel uploads to Firebase",
+  "main": "src/index.js",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "wrangler": "^3.0.0"
+  }
+}
