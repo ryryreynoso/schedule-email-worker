@@ -1,6 +1,6 @@
 import * as XLSX from 'xlsx';
 
-// Service account credentials (will be set as environment variable)
+// Service account credentials
 const SERVICE_ACCOUNT = {
   type: "service_account",
   project_id: "work-schedule-1f2e1",
@@ -157,11 +157,12 @@ export default {
           if (tech && tech !== 'TECH(S)') {
             scheduleData.push({
               date: currentDate,
-              tech: tech,
+              person: tech,
               test: test,
-              zip: zip,
-              iocs: iocs,
-              rt: rt,
+              zipCode: zip,
+              testId: iocs,
+              location: site,
+              mep: rt,
               state: state
             });
           }
@@ -173,38 +174,24 @@ export default {
       // Get access token
       const accessToken = await getAccessToken();
       
-      // Upload to Firestore
+      // Upload to Firestore - match app structure: schedule/current/rows
       const projectId = 'work-schedule-1f2e1';
       
-      // Delete existing documents for this state
-      const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:runQuery`;
-      const queryResponse = await fetch(listUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          structuredQuery: {
-            from: [{ collectionId: 'schedules' }],
-            where: {
-              fieldFilter: {
-                field: { fieldPath: 'state' },
-                op: 'EQUAL',
-                value: { stringValue: state }
-              }
-            }
-          }
-        })
+      // Delete existing documents for this state in schedule/current/rows
+      const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`;
+      const listResponse = await fetch(listUrl, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${accessToken}` }
       });
       
-      const queryData = await queryResponse.json();
+      const listData = await listResponse.json();
       
-      // Delete each existing document
-      if (queryData && Array.isArray(queryData)) {
-        for (const item of queryData) {
-          if (item.document?.name) {
-            await fetch(`https://firestore.googleapis.com/v1/${item.document.name}`, {
+      // Delete documents matching this state
+      if (listData.documents) {
+        for (const doc of listData.documents) {
+          // Check if document has state field matching our state
+          if (doc.fields?.state?.stringValue === state) {
+            await fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
               method: 'DELETE',
               headers: { 'Authorization': `Bearer ${accessToken}` }
             });
@@ -212,21 +199,23 @@ export default {
         }
       }
       
-      // Add new documents
+      // Add new documents to schedule/current/rows
       for (const entry of scheduleData) {
         const docData = {
           fields: {
             date: { stringValue: entry.date },
-            tech: { stringValue: entry.tech },
+            person: { stringValue: entry.person },
             test: { stringValue: entry.test },
-            zip: { stringValue: entry.zip },
-            iocs: { stringValue: entry.iocs },
-            rt: { stringValue: entry.rt },
-            state: { stringValue: entry.state }
+            zipCode: { stringValue: entry.zipCode },
+            testId: { stringValue: entry.testId },
+            location: { stringValue: entry.location },
+            state: { stringValue: entry.state },
+            mep: { stringValue: entry.mep || '' },
+            time: { stringValue: '' }
           }
         };
         
-        await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedules`, {
+        await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${accessToken}`,
