@@ -2,19 +2,20 @@ import * as XLSX from 'xlsx';
 
 export default {
   async email(message, env, ctx) {
+    let debugInfo = [];
+    
     try {
-      console.log('=== EMAIL RECEIVED ===');
-      console.log('From:', message.from);
-      console.log('Subject:', message.headers.get('subject'));
+      debugInfo.push('Email received');
+      debugInfo.push(`From: ${message.from}`);
+      debugInfo.push(`Subject: ${message.headers.get('subject')}`);
       
       // Get Excel attachment
-      console.log('Checking for attachments...');
       const attachments = [...message.attachments];
-      console.log('Total attachments:', attachments.length);
+      debugInfo.push(`Total attachments: ${attachments.length}`);
       
       if (attachments.length > 0) {
         attachments.forEach((att, i) => {
-          console.log(`Attachment ${i + 1}: ${att.name}`);
+          debugInfo.push(`Attachment ${i + 1}: ${att.name}`);
         });
       }
       
@@ -23,49 +24,42 @@ export default {
       );
 
       if (!excelAttachment) {
-        console.log('❌ No Excel file found in email');
+        message.setReject(`DEBUG: No Excel file found. ${debugInfo.join(' | ')}`);
         return;
       }
 
-      console.log('✅ Excel file found:', excelAttachment.name);
+      debugInfo.push(`Excel found: ${excelAttachment.name}`);
 
-      // Read attachment as ArrayBuffer (simplified method)
-      console.log('Reading attachment...');
+      // Read attachment
       const arrayBuffer = await excelAttachment.arrayBuffer();
-      console.log('ArrayBuffer size:', arrayBuffer.byteLength);
+      debugInfo.push(`ArrayBuffer size: ${arrayBuffer.byteLength}`);
       
       // Parse Excel
-      console.log('Parsing Excel...');
       const workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
       const sheetName = workbook.SheetNames[0];
-      console.log('Sheet name:', sheetName);
-      
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-      console.log('✅ Parsed rows:', rawData.length);
+      debugInfo.push(`Parsed ${rawData.length} rows`);
 
-      // Detect state (Nevada or Utah)
+      // Detect state
       const fileName = excelAttachment.name.toLowerCase();
-      let state = 'Nevada'; // Default
+      let state = 'Nevada';
       
       if (fileName.includes('utah') || fileName.includes('ut')) {
         state = 'Utah';
       } else if (fileName.includes('nevada') || fileName.includes('nv')) {
         state = 'Nevada';
       } else {
-        // Try to detect from data (Utah uses full names, Nevada uses initials)
         const sampleTech = rawData[1]?.[findColumnIndex(rawData[0], 'TECH')];
         if (sampleTech && sampleTech.length > 3) {
           state = 'Utah';
         }
       }
 
-      console.log('✅ Detected state:', state);
+      debugInfo.push(`State: ${state}`);
 
-      // Find column indices
+      // Find columns
       const headers = rawData[0] || [];
-      console.log('Headers:', headers);
-      
       const dateCol = findColumnIndex(headers, 'DATE');
       const techCol = findColumnIndex(headers, 'TECH');
       const testCol = findColumnIndex(headers, 'TEST');
@@ -73,10 +67,8 @@ export default {
       const iocsCol = findColumnIndex(headers, 'IOCS');
       const rtCol = findColumnIndex(headers, 'RT');
 
-      console.log('Column indices - DATE:', dateCol, 'TECH:', techCol);
-
       if (dateCol === -1 || techCol === -1) {
-        console.error('❌ Could not find DATE or TECH columns');
+        message.setReject(`DEBUG: Missing columns. ${debugInfo.join(' | ')}`);
         return;
       }
 
@@ -105,50 +97,44 @@ export default {
         });
       }
 
-      console.log('✅ Parsed schedule entries:', scheduleData.length);
+      debugInfo.push(`Schedule entries: ${scheduleData.length}`);
 
       if (scheduleData.length === 0) {
-        console.error('❌ No valid schedule data found');
+        message.setReject(`DEBUG: No valid data. ${debugInfo.join(' | ')}`);
         return;
       }
 
       // Upload to Firebase
       const firebaseUrl = 'https://work-scheduler-1-default-rtdb.firebaseio.com';
-      console.log('Uploading to Firebase...');
       
-      // Delete old state data
       const deleteUrl = `${firebaseUrl}/schedules/${state}.json`;
-      console.log('Deleting old data:', deleteUrl);
       const deleteResponse = await fetch(deleteUrl, { method: 'DELETE' });
-      console.log('Delete response:', deleteResponse.ok);
+      debugInfo.push(`Delete: ${deleteResponse.ok}`);
 
-      // Upload new data
       const uploadUrl = `${firebaseUrl}/schedules/${state}.json`;
-      console.log('Uploading new data:', uploadUrl);
       const uploadResponse = await fetch(uploadUrl, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(scheduleData)
       });
 
-      console.log('Upload response status:', uploadResponse.status);
+      debugInfo.push(`Upload status: ${uploadResponse.status}`);
       
       if (!uploadResponse.ok) {
         const errorText = await uploadResponse.text();
-        console.error('❌ Firebase upload failed:', uploadResponse.status, errorText);
-        throw new Error(`Firebase upload failed: ${uploadResponse.status}`);
+        message.setReject(`DEBUG: Upload failed ${uploadResponse.status}. ${debugInfo.join(' | ')}`);
+        return;
       }
 
-      console.log('✅✅✅ Upload successful:', scheduleData.length, state, 'entries');
+      // SUCCESS - but reject with success message so we can see it
+      message.setReject(`SUCCESS: Uploaded ${scheduleData.length} ${state} entries. ${debugInfo.join(' | ')}`);
 
     } catch (error) {
-      console.error('❌❌❌ Error processing email:', error.message);
-      console.error('Stack:', error.stack);
+      message.setReject(`DEBUG ERROR: ${error.message}. ${debugInfo.join(' | ')}`);
     }
   }
 };
 
-// Helper: Find column index by searching for keyword in headers
 function findColumnIndex(headers, keyword) {
   const searchTerm = keyword.toLowerCase();
   for (let i = 0; i < headers.length; i++) {
@@ -160,30 +146,25 @@ function findColumnIndex(headers, keyword) {
   return -1;
 }
 
-// Helper: Parse Excel date to YYYY-MM-DD
 function parseExcelDate(value) {
   if (!value) return null;
 
-  // If it's already a string date
   if (typeof value === 'string') {
     const cleaned = value.trim();
     if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
       return cleaned;
     }
-    // Try parsing common formats
     const date = new Date(cleaned);
     if (!isNaN(date.getTime())) {
       return formatDate(date);
     }
   }
 
-  // If it's an Excel serial number
   if (typeof value === 'number') {
     const date = new Date((value - 25569) * 86400 * 1000);
     return formatDate(date);
   }
 
-  // If it's already a Date object
   if (value instanceof Date) {
     return formatDate(value);
   }
@@ -191,7 +172,6 @@ function parseExcelDate(value) {
   return null;
 }
 
-// Helper: Format date as YYYY-MM-DD
 function formatDate(date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, '0');
