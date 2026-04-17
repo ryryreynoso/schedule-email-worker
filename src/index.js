@@ -145,24 +145,24 @@ export default {
           continue;
         }
         
-        // Parse data rows
+        // Parse data rows - CORRECTED FIELD MAPPING
         if (currentDate && row.length >= 6) {
-          const zip = String(row[1] || '').trim();
-          const site = String(row[2] || '').trim();
-          const test = String(row[3] || '').trim();
-          const iocs = String(row[4] || '').trim();
-          const tech = String(row[5] || '').trim();
-          const rt = String(row[0] || '').trim();
+          const rt = String(row[0] || '').trim();        // Route/MEP name (Column A)
+          const zip = String(row[1] || '').trim();       // Zip Code (Column B)
+          const site = String(row[2] || '').trim();      // Site/Location (Column C)
+          const test = String(row[3] || '').trim();      // Test Type (Column D)
+          const iocs = String(row[4] || '').trim();      // IOCS/Test ID (Column E)
+          const tech = String(row[5] || '').trim();      // Tech Name (Column F)
           
           if (tech && tech !== 'TECH(S)') {
             scheduleData.push({
               date: currentDate,
               person: tech,
-              test: test,
+              test: rt,           // Route/MEP goes in 'test' field
               zipCode: zip,
               testId: iocs,
               location: site,
-              mep: rt,
+              mep: test,          // Test type goes in 'mep' field
               state: state
             });
           }
