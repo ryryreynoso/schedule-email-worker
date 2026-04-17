@@ -108,9 +108,6 @@ export default {
       
       // Parse Excel
       const workbook = XLSX.read(bytes, { type: 'array' });
-      const sheetName = workbook.SheetNames[0];
-      const sheet = workbook.Sheets[sheetName];
-      const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       
       // Detect state from filename
       let state = 'Nevada';
@@ -120,51 +117,58 @@ export default {
         state = 'Nevada';
       }
       
-      // Parse schedule data
+      // Parse schedule data from ALL SHEETS
       const scheduleData = [];
-      let currentDate = null;
       
-      for (let i = 0; i < rawData.length; i++) {
-        const row = rawData[i];
-        if (!row || row.length === 0) continue;
+      // Loop through ALL sheets in the workbook
+      for (const sheetName of workbook.SheetNames) {
+        const sheet = workbook.Sheets[sheetName];
+        const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
         
-        const firstCell = String(row[0] || '').trim();
+        let currentDate = null;
         
-        // Check if this is a date header row
-        if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
-          const dateMatch = firstCell.match(/(\d{2}-\d{2}-\d{2})/);
-          if (dateMatch) {
-            const dateParts = dateMatch[1].split('-');
-            currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`;
-          }
-          continue;
-        }
-        
-        // Skip header rows
-        if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'TEST SCHEDULE') {
-          continue;
-        }
-        
-        // Parse data rows - CORRECTED FIELD MAPPING
-        if (currentDate && row.length >= 6) {
-          const rt = String(row[0] || '').trim();        // Route/MEP name (Column A)
-          const zip = String(row[1] || '').trim();       // Zip Code (Column B)
-          const site = String(row[2] || '').trim();      // Site/Location (Column C)
-          const test = String(row[3] || '').trim();      // Test Type (Column D)
-          const iocs = String(row[4] || '').trim();      // IOCS/Test ID (Column E)
-          const tech = String(row[5] || '').trim();      // Tech Name (Column F)
+        for (let i = 0; i < rawData.length; i++) {
+          const row = rawData[i];
+          if (!row || row.length === 0) continue;
           
-          if (tech && tech !== 'TECH(S)') {
-            scheduleData.push({
-              date: currentDate,
-              person: tech,
-              test: rt,           // Route/MEP goes in 'test' field
-              zipCode: zip,
-              testId: iocs,
-              location: site,
-              mep: test,          // Test type goes in 'mep' field
-              state: state
-            });
+          const firstCell = String(row[0] || '').trim();
+          
+          // Check if this is a date header row
+          if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
+            const dateMatch = firstCell.match(/(\d{2}-\d{2}-\d{2})/);
+            if (dateMatch) {
+              const dateParts = dateMatch[1].split('-');
+              currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`;
+            }
+            continue;
+          }
+          
+          // Skip header rows
+          if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'TEST SCHEDULE') {
+            continue;
+          }
+          
+          // Parse data rows
+          if (currentDate && row.length >= 6) {
+            const rt = String(row[0] || '').trim();        // Route/MEP name (Column A)
+            const zip = String(row[1] || '').trim();       // Zip Code (Column B)
+            const site = String(row[2] || '').trim();      // Site/Location (Column C)
+            const test = String(row[3] || '').trim();      // Test Type (Column D)
+            const iocs = String(row[4] || '').trim();      // IOCS/Test ID (Column E)
+            const tech = String(row[5] || '').trim();      // Tech Name (Column F)
+            
+            if (tech && tech !== 'TECH(S)') {
+              scheduleData.push({
+                date: currentDate,
+                person: tech,
+                test: rt,           // Route/MEP goes in 'test' field
+                zipCode: zip,
+                testId: iocs,
+                location: site,
+                mep: test,          // Test type goes in 'mep' field
+                state: state
+              });
+            }
           }
         }
       }
@@ -189,7 +193,6 @@ export default {
       // Delete documents matching this state
       if (listData.documents) {
         for (const doc of listData.documents) {
-          // Check if document has state field matching our state
           if (doc.fields?.state?.stringValue === state) {
             await fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
               method: 'DELETE',
