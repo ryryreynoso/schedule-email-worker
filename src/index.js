@@ -9,8 +9,12 @@ export default {
       debugInfo.push(`From: ${message.from}`);
       debugInfo.push(`Subject: ${message.headers.get('subject')}`);
       
-      // Get Excel attachment
-      const attachments = [...message.attachments];
+      // Get Excel attachment - FIXED: message.attachments is async iterable
+      const attachments = [];
+      for await (const att of message.attachments) {
+        attachments.push(att);
+      }
+      
       debugInfo.push(`Total attachments: ${attachments.length}`);
       
       if (attachments.length > 0) {
