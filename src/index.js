@@ -68,13 +68,12 @@ export default {
         
         const firstCell = String(row[0] || '').trim();
         
-        // Check if this is a date header row (e.g., "SAT - 03-28-26 GA-NS SV-AL")
+        // Check if this is a date header row
         if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
-          // Extract date from header (format: "SAT - 03-28-26")
           const dateMatch = firstCell.match(/(\d{2}-\d{2}-\d{2})/);
           if (dateMatch) {
             const dateParts = dateMatch[1].split('-');
-            currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`; // Convert to YYYY-MM-DD
+            currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`;
           }
           continue;
         }
@@ -84,14 +83,14 @@ export default {
           continue;
         }
         
-        // Parse data rows (have zip code in column 1, site in column 2, etc.)
+        // Parse data rows
         if (currentDate && row.length >= 6) {
           const zip = String(row[1] || '').trim();
           const site = String(row[2] || '').trim();
           const test = String(row[3] || '').trim();
           const iocs = String(row[4] || '').trim();
           const tech = String(row[5] || '').trim();
-          const rt = String(row[0] || '').trim(); // Route/test name is in column 0
+          const rt = String(row[0] || '').trim();
           
           if (tech && tech !== 'TECH(S)') {
             scheduleData.push({
@@ -124,12 +123,12 @@ export default {
       });
       
       if (!uploadResponse.ok) {
-        message.setReject(`Upload failed`);
+        const errorText = await uploadResponse.text();
+        message.setReject(`Upload failed: ${uploadResponse.status} ${errorText.substring(0, 50)}`);
         return;
       }
       
-      // SUCCESS - Accept the email now!
-      // Remove the rejection so the email is accepted
+      // SUCCESS - email is accepted (no rejection)
       
     } catch (error) {
       message.setReject(`ERROR: ${error.message}`);
