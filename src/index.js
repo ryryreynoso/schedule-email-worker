@@ -111,14 +111,19 @@ export default {
         state = 'Nevada';
       }
       
+      console.log(`Processing ${state} file: ${fileName}`);
+      console.log(`Total sheets: ${workbook.SheetNames.length}`);
+      
       const scheduleData = [];
       
       // Loop through ALL sheets
       for (const sheetName of workbook.SheetNames) {
+        console.log(`Processing sheet: ${sheetName}`);
         const sheet = workbook.Sheets[sheetName];
         const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
         
         let currentDate = null;
+        let rowsInSheet = 0;
         
         for (let i = 0; i < rawData.length; i++) {
           const row = rawData[i];
@@ -126,17 +131,20 @@ export default {
           
           const firstCell = String(row[0] || '').trim();
           
-          // Match date headers with flexible spacing
+          // Match date headers - more flexible regex
           if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
-            const dateMatch = firstCell.match(/(\d{2})-(\d{2})-(\d{2})/);
+            const dateMatch = firstCell.match(/(\d{1,2})-(\d{1,2})-(\d{2})/);
             if (dateMatch) {
-              const dateParts = [dateMatch[1], dateMatch[2], dateMatch[3]];
-              currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`;
+              const mm = dateMatch[1].padStart(2, '0');
+              const dd = dateMatch[2].padStart(2, '0');
+              const yy = dateMatch[3];
+              currentDate = `20${yy}-${mm}-${dd}`;
+              console.log(`Found date: ${currentDate}`);
             }
             continue;
           }
           
-          if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'TEST SCHEDULE') {
+          if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'UTAH' || firstCell === 'TEST SCHEDULE') {
             continue;
           }
           
@@ -148,7 +156,7 @@ export default {
             const iocs = String(row[4] || '').trim();
             const tech = String(row[5] || '').trim();
             
-            if (tech && tech !== 'TECH(S)') {
+            if (tech && tech !== 'TECH(S)' && rt !== 'ZIP CODES') {
               scheduleData.push({
                 date: currentDate,
                 person: tech,
@@ -159,42 +167,65 @@ export default {
                 mep: test,
                 state: state
               });
+              rowsInSheet++;
             }
           }
         }
+        console.log(`Sheet ${sheetName}: Added ${rowsInSheet} rows`);
       }
+      
+      console.log(`Total entries parsed: ${scheduleData.length}`);
       
       if (scheduleData.length === 0) return;
       
       const accessToken = await getAccessToken();
       const projectId = 'work-schedule-1f2e1';
       
-      // Delete existing documents for this state
-      const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`;
-      const listResponse = await fetch(listUrl, {
-        method: 'GET',
-        headers: { 'Authorization': `Bearer ${accessToken}` }
-      });
+      // CORRECTED DELETE - List all documents in schedule/current/rows, then filter and delete
+      const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows?pageSize=1000`;
       
-      const listData = await listResponse.json();
+      let deletedCount = 0;
+      let pageToken = '';
       
-      if (listData.documents) {
-        const deletePromises = [];
-        for (const doc of listData.documents) {
-          if (doc.fields?.state?.stringValue === state) {
-            deletePromises.push(
-              fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
-                method: 'DELETE',
-                headers: { 'Authorization': `Bearer ${accessToken}` }
-              })
-            );
+      do {
+        const url = pageToken ? `${listUrl}&pageToken=${pageToken}` : listUrl;
+        const listResponse = await fetch(url, {
+          method: 'GET',
+          headers: { 'Authorization': `Bearer ${accessToken}` }
+        });
+        
+        const listData = await listResponse.json();
+        
+        if (listData.documents) {
+          const deletePromises = [];
+          for (const doc of listData.documents) {
+            // Check if this document matches our state
+            if (doc.fields?.state?.stringValue === state) {
+              deletePromises.push(
+                fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
+                  method: 'DELETE',
+                  headers: { 'Authorization': `Bearer ${accessToken}` }
+                })
+              );
+            }
+          }
+          
+          if (deletePromises.length > 0) {
+            await Promise.all(deletePromises);
+            deletedCount += deletePromises.length;
+            console.log(`Deleted ${deletePromises.length} documents (total: ${deletedCount})`);
           }
         }
-        await Promise.all(deletePromises);
-      }
+        
+        pageToken = listData.nextPageToken || '';
+      } while (pageToken);
+      
+      console.log(`✅ Deletion complete: ${deletedCount} old documents for ${state}`);
       
       // Batch upload in chunks of 50
       const BATCH_SIZE = 50;
+      let uploadedCount = 0;
+      
       for (let i = 0; i < scheduleData.length; i += BATCH_SIZE) {
         const batch = scheduleData.slice(i, i + BATCH_SIZE);
         const uploadPromises = batch.map(entry => {
@@ -223,15 +254,19 @@ export default {
         });
         
         await Promise.all(uploadPromises);
+        uploadedCount += batch.length;
+        console.log(`Uploaded ${uploadedCount}/${scheduleData.length} documents`);
         
-        // Small delay between batches to avoid rate limits
+        // Small delay between batches
         if (i + BATCH_SIZE < scheduleData.length) {
           await sleep(100);
         }
       }
       
+      console.log(`✅ Upload complete: ${uploadedCount} documents for ${state}`);
+      
     } catch (error) {
-      console.error('Error:', error);
+      console.error('❌ Error:', error);
     }
   }
 };
