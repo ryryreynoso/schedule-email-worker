@@ -28,10 +28,7 @@ export default {
         }
       }
       
-      if (!excelPart || !fileName) {
-        message.setReject('No Excel file');
-        return;
-      }
+      if (!excelPart || !fileName) return;
       
       // Extract base64 data
       const headerEndIndex = excelPart.indexOf('\r\n\r\n');
@@ -53,34 +50,6 @@ export default {
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       
-      // Find header row - look for row with multiple column-like headers
-      // Common headers: DATE, TECH, TEST, ZIP, IOCS, RT, ROUTE, SCHEDULE
-      let headerRowIndex = -1;
-      for (let i = 0; i < Math.min(10, rawData.length); i++) {
-        const row = rawData[i] || [];
-        if (row.length < 3) continue; // Skip rows with too few columns
-        
-        const rowStr = row.map(cell => String(cell || '').toUpperCase()).join('|');
-        
-        // Look for common schedule headers
-        const hasDate = rowStr.includes('DATE') || rowStr.includes('DAY');
-        const hasTech = rowStr.includes('TECH') || rowStr.includes('NAME') || rowStr.includes('EMPLOYEE');
-        
-        if (hasDate && hasTech) {
-          headerRowIndex = i;
-          break;
-        }
-      }
-      
-      if (headerRowIndex === -1) {
-        // If still not found, show first 5 rows for debugging
-        const debugRows = rawData.slice(0, 5).map((r, i) => `R${i}:${JSON.stringify(r).substring(0, 50)}`).join(' | ');
-        message.setReject(`Headers not found. First rows: ${debugRows}`);
-        return;
-      }
-      
-      const headers = rawData[headerRowIndex];
-      
       // Detect state from filename
       let state = 'Nevada';
       if (fileName.toLowerCase().includes('utah') || fileName.toLowerCase().includes('ut')) {
@@ -89,46 +58,57 @@ export default {
         state = 'Nevada';
       }
       
-      // Find columns
-      const dateCol = findColumnIndex(headers, 'DATE');
-      const techCol = findColumnIndex(headers, 'TECH');
-      const testCol = findColumnIndex(headers, 'TEST');
-      const zipCol = findColumnIndex(headers, 'ZIP');
-      const iocsCol = findColumnIndex(headers, 'IOCS');
-      const rtCol = findColumnIndex(headers, 'RT');
-      
-      if (dateCol === -1 || techCol === -1) {
-        message.setReject(`Cols: DATE=${dateCol} TECH=${techCol} Headers:${JSON.stringify(headers).substring(0, 100)}`);
-        return;
-      }
-      
       // Parse schedule data
       const scheduleData = [];
-      for (let i = headerRowIndex + 1; i < rawData.length; i++) {
+      let currentDate = null;
+      
+      for (let i = 0; i < rawData.length; i++) {
         const row = rawData[i];
         if (!row || row.length === 0) continue;
         
-        const dateValue = row[dateCol];
-        const tech = row[techCol];
+        const firstCell = String(row[0] || '').trim();
         
-        if (!dateValue || !tech) continue;
+        // Check if this is a date header row (e.g., "SAT - 03-28-26 GA-NS SV-AL")
+        if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
+          // Extract date from header (format: "SAT - 03-28-26")
+          const dateMatch = firstCell.match(/(\d{2}-\d{2}-\d{2})/);
+          if (dateMatch) {
+            const dateParts = dateMatch[1].split('-');
+            currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`; // Convert to YYYY-MM-DD
+          }
+          continue;
+        }
         
-        const date = parseExcelDate(dateValue);
-        if (!date) continue;
+        // Skip header rows
+        if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'TEST SCHEDULE') {
+          continue;
+        }
         
-        scheduleData.push({
-          date: date,
-          tech: String(tech).trim(),
-          test: testCol !== -1 ? String(row[testCol] || '').trim() : '',
-          zip: zipCol !== -1 ? String(row[zipCol] || '').trim() : '',
-          iocs: iocsCol !== -1 ? String(row[iocsCol] || '').trim() : '',
-          rt: rtCol !== -1 ? String(row[rtCol] || '').trim() : '',
-          state: state
-        });
+        // Parse data rows (have zip code in column 1, site in column 2, etc.)
+        if (currentDate && row.length >= 6) {
+          const zip = String(row[1] || '').trim();
+          const site = String(row[2] || '').trim();
+          const test = String(row[3] || '').trim();
+          const iocs = String(row[4] || '').trim();
+          const tech = String(row[5] || '').trim();
+          const rt = String(row[0] || '').trim(); // Route/test name is in column 0
+          
+          if (tech && tech !== 'TECH(S)') {
+            scheduleData.push({
+              date: currentDate,
+              tech: tech,
+              test: test,
+              zip: zip,
+              iocs: iocs,
+              rt: rt,
+              state: state
+            });
+          }
+        }
       }
       
       if (scheduleData.length === 0) {
-        message.setReject('No data found');
+        message.setReject('No data parsed');
         return;
       }
       
@@ -144,59 +124,15 @@ export default {
       });
       
       if (!uploadResponse.ok) {
-        message.setReject(`Upload failed ${uploadResponse.status}`);
+        message.setReject(`Upload failed`);
         return;
       }
       
-      // SUCCESS
-      message.setReject(`SUCCESS: ${scheduleData.length} ${state} entries`);
+      // SUCCESS - Accept the email now!
+      // Remove the rejection so the email is accepted
       
     } catch (error) {
       message.setReject(`ERROR: ${error.message}`);
     }
   }
 };
-
-function findColumnIndex(headers, keyword) {
-  const searchTerm = keyword.toLowerCase();
-  for (let i = 0; i < headers.length; i++) {
-    const header = String(headers[i] || '').toLowerCase();
-    if (header.includes(searchTerm)) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-function parseExcelDate(value) {
-  if (!value) return null;
-  
-  if (typeof value === 'string') {
-    const cleaned = value.trim();
-    if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
-      return cleaned;
-    }
-    const date = new Date(cleaned);
-    if (!isNaN(date.getTime())) {
-      return formatDate(date);
-    }
-  }
-  
-  if (typeof value === 'number') {
-    const date = new Date((value - 25569) * 86400 * 1000);
-    return formatDate(date);
-  }
-  
-  if (value instanceof Date) {
-    return formatDate(value);
-  }
-  
-  return null;
-}
-
-function formatDate(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${year}-${month}-${day}`;
-}
