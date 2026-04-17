@@ -29,9 +29,9 @@ export default {
 
       console.log('✅ Excel file found:', excelAttachment.name);
 
-      // Read attachment as ArrayBuffer
-      console.log('Reading attachment stream...');
-      const arrayBuffer = await streamToArrayBuffer(excelAttachment);
+      // Read attachment as ArrayBuffer (simplified method)
+      console.log('Reading attachment...');
+      const arrayBuffer = await excelAttachment.arrayBuffer();
       console.log('ArrayBuffer size:', arrayBuffer.byteLength);
       
       // Parse Excel
@@ -197,27 +197,4 @@ function formatDate(date) {
   const month = String(date.getMonth() + 1).padStart(2, '0');
   const day = String(date.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
-}
-
-// Helper: Convert stream to ArrayBuffer
-async function streamToArrayBuffer(stream) {
-  const reader = stream.getReader();
-  const chunks = [];
-  
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-  }
-  
-  const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  
-  return result.buffer;
 }
