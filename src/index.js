@@ -18,7 +18,7 @@ export default {
       const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
       
       if (!boundaryMatch) {
-        message.setReject(`DEBUG: No boundary found in content-type. ${debugInfo.join(' | ')}`);
+        message.setReject(`DEBUG: No boundary found. ${debugInfo.join(' | ')}`);
         return;
       }
       
@@ -27,7 +27,7 @@ export default {
       
       // Split email by boundary
       const parts = rawEmail.split(`--${boundary}`);
-      debugInfo.push(`Email parts: ${parts.length}`);
+      debugInfo.push(`Parts: ${parts.length}`);
       
       // Find Excel attachment
       let excelPart = null;
@@ -38,7 +38,6 @@ export default {
             (part.includes('.xlsx') || part.includes('.xls'))) {
           excelPart = part;
           
-          // Extract filename
           const fileNameMatch = part.match(/filename="?([^"\r\n]+)"?/);
           if (fileNameMatch) {
             fileName = fileNameMatch[1];
@@ -48,44 +47,50 @@ export default {
       }
       
       if (!excelPart || !fileName) {
-        message.setReject(`DEBUG: No Excel attachment found. ${debugInfo.join(' | ')}`);
+        message.setReject(`DEBUG: No Excel attachment. ${debugInfo.join(' | ')}`);
         return;
       }
       
-      debugInfo.push(`Excel found: ${fileName}`);
+      debugInfo.push(`Excel: ${fileName}`);
       
-      // Extract base64 data
-      const lines = excelPart.split('\r\n');
-      let base64Data = '';
-      let inData = false;
-      
-      for (const line of lines) {
-        if (line.trim() === '') {
-          inData = true;
-          continue;
-        }
-        if (inData && !line.startsWith('--')) {
-          base64Data += line.trim();
-        }
+      // Extract base64 data - find the blank line after headers, then extract until next boundary
+      const headerEndIndex = excelPart.indexOf('\r\n\r\n');
+      if (headerEndIndex === -1) {
+        message.setReject(`DEBUG: No header end found. ${debugInfo.join(' | ')}`);
+        return;
       }
       
-      debugInfo.push(`Base64 length: ${base64Data.length}`);
+      const dataSection = excelPart.substring(headerEndIndex + 4);
+      
+      // Remove any trailing boundary markers and clean whitespace
+      let base64Data = dataSection
+        .split('--')[0]  // Stop at next boundary
+        .replace(/\r\n/g, '')  // Remove line breaks
+        .replace(/\s/g, '');   // Remove all whitespace
+      
+      debugInfo.push(`Base64 len: ${base64Data.length}`);
       
       // Decode base64 to ArrayBuffer
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      let bytes;
+      try {
+        const binaryString = atob(base64Data);
+        bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+      } catch (e) {
+        message.setReject(`DEBUG: Base64 decode failed: ${e.message}. ${debugInfo.join(' | ')}`);
+        return;
       }
       
-      debugInfo.push(`ArrayBuffer size: ${bytes.length}`);
+      debugInfo.push(`Bytes: ${bytes.length}`);
       
       // Parse Excel
       const workbook = XLSX.read(bytes, { type: 'array' });
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-      debugInfo.push(`Parsed ${rawData.length} rows`);
+      debugInfo.push(`Rows: ${rawData.length}`);
 
       // Detect state
       let state = 'Nevada';
@@ -113,7 +118,7 @@ export default {
       const rtCol = findColumnIndex(headers, 'RT');
 
       if (dateCol === -1 || techCol === -1) {
-        message.setReject(`DEBUG: Missing columns DATE=${dateCol} TECH=${techCol}. ${debugInfo.join(' | ')}`);
+        message.setReject(`DEBUG: Missing cols DATE=${dateCol} TECH=${techCol}. ${debugInfo.join(' | ')}`);
         return;
       }
 
@@ -142,7 +147,7 @@ export default {
         });
       }
 
-      debugInfo.push(`Schedule entries: ${scheduleData.length}`);
+      debugInfo.push(`Entries: ${scheduleData.length}`);
 
       if (scheduleData.length === 0) {
         message.setReject(`DEBUG: No valid data. ${debugInfo.join(' | ')}`);
@@ -154,7 +159,6 @@ export default {
       
       const deleteUrl = `${firebaseUrl}/schedules/${state}.json`;
       const deleteResponse = await fetch(deleteUrl, { method: 'DELETE' });
-      debugInfo.push(`Delete: ${deleteResponse.ok}`);
 
       const uploadUrl = `${firebaseUrl}/schedules/${state}.json`;
       const uploadResponse = await fetch(uploadUrl, {
@@ -163,19 +167,18 @@ export default {
         body: JSON.stringify(scheduleData)
       });
 
-      debugInfo.push(`Upload status: ${uploadResponse.status}`);
+      debugInfo.push(`Upload: ${uploadResponse.status}`);
       
       if (!uploadResponse.ok) {
-        const errorText = await uploadResponse.text();
-        message.setReject(`DEBUG: Upload failed ${uploadResponse.status} ${errorText}. ${debugInfo.join(' | ')}`);
+        message.setReject(`DEBUG: Upload failed ${uploadResponse.status}. ${debugInfo.join(' | ')}`);
         return;
       }
 
-      // SUCCESS - but reject with success message so we can see it
-      message.setReject(`SUCCESS: Uploaded ${scheduleData.length} ${state} entries. ${debugInfo.join(' | ')}`);
+      // SUCCESS
+      message.setReject(`SUCCESS: ${scheduleData.length} ${state} entries uploaded. ${debugInfo.join(' | ')}`);
 
     } catch (error) {
-      message.setReject(`DEBUG ERROR: ${error.message} at ${error.stack}. ${debugInfo.join(' | ')}`);
+      message.setReject(`ERROR: ${error.message}. ${debugInfo.join(' | ')}`);
     }
   }
 };
