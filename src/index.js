@@ -2,32 +2,17 @@ import * as XLSX from 'xlsx';
 
 export default {
   async email(message, env, ctx) {
-    let debugInfo = [];
-    
     try {
-      debugInfo.push('Email received');
-      debugInfo.push(`From: ${message.from}`);
-      debugInfo.push(`Subject: ${message.headers.get('subject')}`);
-      
-      // Get raw email as text
+      // Get raw email
       const rawEmail = await new Response(message.raw).text();
-      debugInfo.push(`Raw email size: ${rawEmail.length}`);
       
-      // Find boundary from Content-Type header
+      // Find boundary
       const contentType = message.headers.get('content-type') || '';
       const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
-      
-      if (!boundaryMatch) {
-        message.setReject(`DEBUG: No boundary found. ${debugInfo.join(' | ')}`);
-        return;
-      }
+      if (!boundaryMatch) return;
       
       const boundary = boundaryMatch[1];
-      debugInfo.push(`Boundary: ${boundary}`);
-      
-      // Split email by boundary
       const parts = rawEmail.split(`--${boundary}`);
-      debugInfo.push(`Parts: ${parts.length}`);
       
       // Find Excel attachment
       let excelPart = null;
@@ -37,80 +22,63 @@ export default {
         if (part.includes('Content-Disposition: attachment') && 
             (part.includes('.xlsx') || part.includes('.xls'))) {
           excelPart = part;
-          
           const fileNameMatch = part.match(/filename="?([^"\r\n]+)"?/);
-          if (fileNameMatch) {
-            fileName = fileNameMatch[1];
-          }
+          if (fileNameMatch) fileName = fileNameMatch[1];
           break;
         }
       }
       
       if (!excelPart || !fileName) {
-        message.setReject(`DEBUG: No Excel attachment. ${debugInfo.join(' | ')}`);
+        message.setReject('No Excel file');
         return;
       }
-      
-      debugInfo.push(`Excel: ${fileName}`);
       
       // Extract base64 data
       const headerEndIndex = excelPart.indexOf('\r\n\r\n');
-      if (headerEndIndex === -1) {
-        message.setReject(`DEBUG: No header end found. ${debugInfo.join(' | ')}`);
-        return;
-      }
+      if (headerEndIndex === -1) return;
       
       const dataSection = excelPart.substring(headerEndIndex + 4);
-      
-      let base64Data = dataSection
-        .split('--')[0]
-        .replace(/\r\n/g, '')
-        .replace(/\s/g, '');
-      
-      debugInfo.push(`Base64 len: ${base64Data.length}`);
+      let base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
       
       // Decode base64
-      let bytes;
-      try {
-        const binaryString = atob(base64Data);
-        bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-      } catch (e) {
-        message.setReject(`DEBUG: Base64 decode failed: ${e.message}. ${debugInfo.join(' | ')}`);
-        return;
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
       }
-      
-      debugInfo.push(`Bytes: ${bytes.length}`);
       
       // Parse Excel
       const workbook = XLSX.read(bytes, { type: 'array' });
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-      debugInfo.push(`Rows: ${rawData.length}`);
-
-      // Row 0 is title ("NEVADA"), Row 1 is actual headers
-      const headers = rawData[1] || [];
-      debugInfo.push(`Headers: ${JSON.stringify(headers).substring(0, 200)}`);
-
-      // Detect state
-      let state = 'Nevada';
       
+      // Find header row (look for row containing "DATE" and "TECH")
+      let headerRowIndex = -1;
+      for (let i = 0; i < Math.min(10, rawData.length); i++) {
+        const row = rawData[i] || [];
+        const rowStr = row.join('|').toUpperCase();
+        if (rowStr.includes('DATE') && rowStr.includes('TECH')) {
+          headerRowIndex = i;
+          break;
+        }
+      }
+      
+      if (headerRowIndex === -1) {
+        message.setReject('Header row not found');
+        return;
+      }
+      
+      const headers = rawData[headerRowIndex];
+      
+      // Detect state from filename
+      let state = 'Nevada';
       if (fileName.toLowerCase().includes('utah') || fileName.toLowerCase().includes('ut')) {
         state = 'Utah';
       } else if (fileName.toLowerCase().includes('nevada') || fileName.toLowerCase().includes('nv')) {
         state = 'Nevada';
-      } else {
-        const sampleTech = rawData[2]?.[findColumnIndex(headers, 'TECH')];
-        if (sampleTech && sampleTech.length > 3) {
-          state = 'Utah';
-        }
       }
-
-      debugInfo.push(`State: ${state}`);
-
+      
       // Find columns
       const dateCol = findColumnIndex(headers, 'DATE');
       const techCol = findColumnIndex(headers, 'TECH');
@@ -118,26 +86,26 @@ export default {
       const zipCol = findColumnIndex(headers, 'ZIP');
       const iocsCol = findColumnIndex(headers, 'IOCS');
       const rtCol = findColumnIndex(headers, 'RT');
-
+      
       if (dateCol === -1 || techCol === -1) {
-        message.setReject(`DEBUG: Missing cols DATE=${dateCol} TECH=${techCol}. ${debugInfo.join(' | ')}`);
+        message.setReject(`Cols not found DATE=${dateCol} TECH=${techCol}`);
         return;
       }
-
-      // Parse schedule data (start from row 2, skip title and header rows)
+      
+      // Parse schedule data (start from row after headers)
       const scheduleData = [];
-      for (let i = 2; i < rawData.length; i++) {
+      for (let i = headerRowIndex + 1; i < rawData.length; i++) {
         const row = rawData[i];
         if (!row || row.length === 0) continue;
-
+        
         const dateValue = row[dateCol];
         const tech = row[techCol];
         
         if (!dateValue || !tech) continue;
-
+        
         const date = parseExcelDate(dateValue);
         if (!date) continue;
-
+        
         scheduleData.push({
           date: date,
           tech: String(tech).trim(),
@@ -148,39 +116,33 @@ export default {
           state: state
         });
       }
-
-      debugInfo.push(`Entries: ${scheduleData.length}`);
-
+      
       if (scheduleData.length === 0) {
-        message.setReject(`DEBUG: No valid data. ${debugInfo.join(' | ')}`);
+        message.setReject('No data found');
         return;
       }
-
+      
       // Upload to Firebase
       const firebaseUrl = 'https://work-scheduler-1-default-rtdb.firebaseio.com';
       
-      const deleteUrl = `${firebaseUrl}/schedules/${state}.json`;
-      await fetch(deleteUrl, { method: 'DELETE' });
-
-      const uploadUrl = `${firebaseUrl}/schedules/${state}.json`;
-      const uploadResponse = await fetch(uploadUrl, {
+      await fetch(`${firebaseUrl}/schedules/${state}.json`, { method: 'DELETE' });
+      
+      const uploadResponse = await fetch(`${firebaseUrl}/schedules/${state}.json`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(scheduleData)
       });
-
-      debugInfo.push(`Upload: ${uploadResponse.status}`);
       
       if (!uploadResponse.ok) {
-        message.setReject(`DEBUG: Upload failed ${uploadResponse.status}. ${debugInfo.join(' | ')}`);
+        message.setReject(`Upload failed ${uploadResponse.status}`);
         return;
       }
-
+      
       // SUCCESS
-      message.setReject(`SUCCESS: ${scheduleData.length} ${state} entries uploaded. ${debugInfo.join(' | ')}`);
-
+      message.setReject(`SUCCESS: ${scheduleData.length} ${state} entries`);
+      
     } catch (error) {
-      message.setReject(`ERROR: ${error.message}. ${debugInfo.join(' | ')}`);
+      message.setReject(`ERROR: ${error.message}`);
     }
   }
 };
@@ -198,7 +160,7 @@ function findColumnIndex(headers, keyword) {
 
 function parseExcelDate(value) {
   if (!value) return null;
-
+  
   if (typeof value === 'string') {
     const cleaned = value.trim();
     if (/^\d{4}-\d{2}-\d{2}$/.test(cleaned)) {
@@ -209,16 +171,16 @@ function parseExcelDate(value) {
       return formatDate(date);
     }
   }
-
+  
   if (typeof value === 'number') {
     const date = new Date((value - 25569) * 86400 * 1000);
     return formatDate(date);
   }
-
+  
   if (value instanceof Date) {
     return formatDate(value);
   }
-
+  
   return null;
 }
 
