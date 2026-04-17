@@ -106,32 +106,23 @@ export default {
         }
       }
       
-      if (scheduleData.length === 0) {
-        message.setReject('No data parsed');
-        return;
-      }
+      if (scheduleData.length === 0) return;
       
       // Upload to Firebase
       const firebaseUrl = 'https://work-schedule-1f2e1-default-rtdb.firebaseio.com';
       
       await fetch(`${firebaseUrl}/schedules/${state}.json`, { method: 'DELETE' });
       
-      const uploadResponse = await fetch(`${firebaseUrl}/schedules/${state}.json`, {
+      await fetch(`${firebaseUrl}/schedules/${state}.json`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(scheduleData)
       });
       
-      if (!uploadResponse.ok) {
-        const errorText = await uploadResponse.text();
-        message.setReject(`Upload failed: ${uploadResponse.status} ${errorText.substring(0, 50)}`);
-        return;
-      }
-      
-      // SUCCESS - email is accepted (no rejection)
+      // SUCCESS - email accepted silently
       
     } catch (error) {
-      message.setReject(`ERROR: ${error.message}`);
+      // Silent failure - email still accepted
     }
   }
 };
