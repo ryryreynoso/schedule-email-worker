@@ -1,6 +1,5 @@
 import * as XLSX from 'xlsx';
 
-// Service account credentials
 const SERVICE_ACCOUNT = {
   type: "service_account",
   project_id: "work-schedule-1f2e1",
@@ -23,7 +22,6 @@ async function getAccessToken() {
   
   const unsignedToken = `${jwtHeader}.${jwtClaimSet}`;
   
-  // Import private key
   const pemHeader = "-----BEGIN PRIVATE KEY-----";
   const pemFooter = "-----END PRIVATE KEY-----";
   const pemContents = SERVICE_ACCOUNT.private_key.substring(
@@ -51,7 +49,6 @@ async function getAccessToken() {
   
   const jwt = `${unsignedToken}.${signatureBase64}`;
   
-  // Exchange JWT for access token
   const tokenResponse = await fetch(SERVICE_ACCOUNT.token_uri, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -62,13 +59,15 @@ async function getAccessToken() {
   return tokenData.access_token;
 }
 
+async function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 export default {
   async email(message, env, ctx) {
     try {
-      // Get raw email
       const rawEmail = await new Response(message.raw).text();
       
-      // Find boundary
       const contentType = message.headers.get('content-type') || '';
       const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
       if (!boundaryMatch) return;
@@ -76,7 +75,6 @@ export default {
       const boundary = boundaryMatch[1];
       const parts = rawEmail.split(`--${boundary}`);
       
-      // Find Excel attachment
       let excelPart = null;
       let fileName = null;
       
@@ -92,24 +90,20 @@ export default {
       
       if (!excelPart || !fileName) return;
       
-      // Extract base64 data
       const headerEndIndex = excelPart.indexOf('\r\n\r\n');
       if (headerEndIndex === -1) return;
       
       const dataSection = excelPart.substring(headerEndIndex + 4);
       let base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
       
-      // Decode base64
       const binaryString = atob(base64Data);
       const bytes = new Uint8Array(binaryString.length);
       for (let i = 0; i < binaryString.length; i++) {
         bytes[i] = binaryString.charCodeAt(i);
       }
       
-      // Parse Excel
       const workbook = XLSX.read(bytes, { type: 'array' });
       
-      // Detect state from filename
       let state = 'Nevada';
       if (fileName.toLowerCase().includes('utah') || fileName.toLowerCase().includes('ut')) {
         state = 'Utah';
@@ -117,10 +111,9 @@ export default {
         state = 'Nevada';
       }
       
-      // Parse schedule data from ALL SHEETS
       const scheduleData = [];
       
-      // Loop through ALL sheets in the workbook
+      // Loop through ALL sheets
       for (const sheetName of workbook.SheetNames) {
         const sheet = workbook.Sheets[sheetName];
         const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
@@ -133,39 +126,37 @@ export default {
           
           const firstCell = String(row[0] || '').trim();
           
-          // Check if this is a date header row
+          // Match date headers with flexible spacing
           if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
-            const dateMatch = firstCell.match(/(\d{2}-\d{2}-\d{2})/);
+            const dateMatch = firstCell.match(/(\d{2})-(\d{2})-(\d{2})/);
             if (dateMatch) {
-              const dateParts = dateMatch[1].split('-');
+              const dateParts = [dateMatch[1], dateMatch[2], dateMatch[3]];
               currentDate = `20${dateParts[2]}-${dateParts[0]}-${dateParts[1]}`;
             }
             continue;
           }
           
-          // Skip header rows
           if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'TEST SCHEDULE') {
             continue;
           }
           
-          // Parse data rows
           if (currentDate && row.length >= 6) {
-            const rt = String(row[0] || '').trim();        // Route/MEP name (Column A)
-            const zip = String(row[1] || '').trim();       // Zip Code (Column B)
-            const site = String(row[2] || '').trim();      // Site/Location (Column C)
-            const test = String(row[3] || '').trim();      // Test Type (Column D)
-            const iocs = String(row[4] || '').trim();      // IOCS/Test ID (Column E)
-            const tech = String(row[5] || '').trim();      // Tech Name (Column F)
+            const rt = String(row[0] || '').trim();
+            const zip = String(row[1] || '').trim();
+            const site = String(row[2] || '').trim();
+            const test = String(row[3] || '').trim();
+            const iocs = String(row[4] || '').trim();
+            const tech = String(row[5] || '').trim();
             
             if (tech && tech !== 'TECH(S)') {
               scheduleData.push({
                 date: currentDate,
                 person: tech,
-                test: rt,           // Route/MEP goes in 'test' field
+                test: rt,
                 zipCode: zip,
                 testId: iocs,
                 location: site,
-                mep: test,          // Test type goes in 'mep' field
+                mep: test,
                 state: state
               });
             }
@@ -175,13 +166,10 @@ export default {
       
       if (scheduleData.length === 0) return;
       
-      // Get access token
       const accessToken = await getAccessToken();
-      
-      // Upload to Firestore - match app structure: schedule/current/rows
       const projectId = 'work-schedule-1f2e1';
       
-      // Delete existing documents for this state in schedule/current/rows
+      // Delete existing documents for this state
       const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`;
       const listResponse = await fetch(listUrl, {
         method: 'GET',
@@ -190,48 +178,59 @@ export default {
       
       const listData = await listResponse.json();
       
-      // Delete documents matching this state
       if (listData.documents) {
+        const deletePromises = [];
         for (const doc of listData.documents) {
           if (doc.fields?.state?.stringValue === state) {
-            await fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
-              method: 'DELETE',
-              headers: { 'Authorization': `Bearer ${accessToken}` }
-            });
+            deletePromises.push(
+              fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${accessToken}` }
+              })
+            );
           }
+        }
+        await Promise.all(deletePromises);
+      }
+      
+      // Batch upload in chunks of 50
+      const BATCH_SIZE = 50;
+      for (let i = 0; i < scheduleData.length; i += BATCH_SIZE) {
+        const batch = scheduleData.slice(i, i + BATCH_SIZE);
+        const uploadPromises = batch.map(entry => {
+          const docData = {
+            fields: {
+              date: { stringValue: entry.date },
+              person: { stringValue: entry.person },
+              test: { stringValue: entry.test },
+              zipCode: { stringValue: entry.zipCode },
+              testId: { stringValue: entry.testId },
+              location: { stringValue: entry.location },
+              state: { stringValue: entry.state },
+              mep: { stringValue: entry.mep || '' },
+              time: { stringValue: '' }
+            }
+          };
+          
+          return fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(docData)
+          });
+        });
+        
+        await Promise.all(uploadPromises);
+        
+        // Small delay between batches to avoid rate limits
+        if (i + BATCH_SIZE < scheduleData.length) {
+          await sleep(100);
         }
       }
       
-      // Add new documents to schedule/current/rows
-      for (const entry of scheduleData) {
-        const docData = {
-          fields: {
-            date: { stringValue: entry.date },
-            person: { stringValue: entry.person },
-            test: { stringValue: entry.test },
-            zipCode: { stringValue: entry.zipCode },
-            testId: { stringValue: entry.testId },
-            location: { stringValue: entry.location },
-            state: { stringValue: entry.state },
-            mep: { stringValue: entry.mep || '' },
-            time: { stringValue: '' }
-          }
-        };
-        
-        await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-          },
-          body: JSON.stringify(docData)
-        });
-      }
-      
-      // SUCCESS - email accepted silently
-      
     } catch (error) {
-      // Silent failure - email still accepted
       console.error('Error:', error);
     }
   }
