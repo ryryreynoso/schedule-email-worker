@@ -53,7 +53,7 @@ export default {
       
       debugInfo.push(`Excel: ${fileName}`);
       
-      // Extract base64 data - find the blank line after headers, then extract until next boundary
+      // Extract base64 data
       const headerEndIndex = excelPart.indexOf('\r\n\r\n');
       if (headerEndIndex === -1) {
         message.setReject(`DEBUG: No header end found. ${debugInfo.join(' | ')}`);
@@ -62,15 +62,14 @@ export default {
       
       const dataSection = excelPart.substring(headerEndIndex + 4);
       
-      // Remove any trailing boundary markers and clean whitespace
       let base64Data = dataSection
-        .split('--')[0]  // Stop at next boundary
-        .replace(/\r\n/g, '')  // Remove line breaks
-        .replace(/\s/g, '');   // Remove all whitespace
+        .split('--')[0]
+        .replace(/\r\n/g, '')
+        .replace(/\s/g, '');
       
       debugInfo.push(`Base64 len: ${base64Data.length}`);
       
-      // Decode base64 to ArrayBuffer
+      // Decode base64
       let bytes;
       try {
         const binaryString = atob(base64Data);
@@ -92,6 +91,10 @@ export default {
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       debugInfo.push(`Rows: ${rawData.length}`);
 
+      // Show actual headers for debugging
+      const headers = rawData[0] || [];
+      debugInfo.push(`Headers: ${JSON.stringify(headers).substring(0, 200)}`);
+
       // Detect state
       let state = 'Nevada';
       
@@ -100,7 +103,7 @@ export default {
       } else if (fileName.toLowerCase().includes('nevada') || fileName.toLowerCase().includes('nv')) {
         state = 'Nevada';
       } else {
-        const sampleTech = rawData[1]?.[findColumnIndex(rawData[0], 'TECH')];
+        const sampleTech = rawData[1]?.[findColumnIndex(headers, 'TECH')];
         if (sampleTech && sampleTech.length > 3) {
           state = 'Utah';
         }
@@ -109,7 +112,6 @@ export default {
       debugInfo.push(`State: ${state}`);
 
       // Find columns
-      const headers = rawData[0] || [];
       const dateCol = findColumnIndex(headers, 'DATE');
       const techCol = findColumnIndex(headers, 'TECH');
       const testCol = findColumnIndex(headers, 'TEST');
@@ -158,7 +160,7 @@ export default {
       const firebaseUrl = 'https://work-scheduler-1-default-rtdb.firebaseio.com';
       
       const deleteUrl = `${firebaseUrl}/schedules/${state}.json`;
-      const deleteResponse = await fetch(deleteUrl, { method: 'DELETE' });
+      await fetch(deleteUrl, { method: 'DELETE' });
 
       const uploadUrl = `${firebaseUrl}/schedules/${state}.json`;
       const uploadResponse = await fetch(uploadUrl, {
