@@ -1,5 +1,4 @@
 import * as XLSX from 'xlsx';
-import { EmailMessage } from 'cloudflare:email';
 
 export default {
   async email(message, env, ctx) {
@@ -10,61 +9,90 @@ export default {
       debugInfo.push(`From: ${message.from}`);
       debugInfo.push(`Subject: ${message.headers.get('subject')}`);
       
-      // Parse email to get parts
-      let emailMessage;
-      try {
-        emailMessage = await EmailMessage.parse(message.raw);
-        debugInfo.push('Email parsed');
-      } catch (e) {
-        debugInfo.push(`Parse failed: ${e.message}`);
-        message.setReject(`DEBUG: Parse error. ${debugInfo.join(' | ')}`);
+      // Get raw email as text
+      const rawEmail = await new Response(message.raw).text();
+      debugInfo.push(`Raw email size: ${rawEmail.length}`);
+      
+      // Find boundary from Content-Type header
+      const contentType = message.headers.get('content-type') || '';
+      const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
+      
+      if (!boundaryMatch) {
+        message.setReject(`DEBUG: No boundary found in content-type. ${debugInfo.join(' | ')}`);
         return;
       }
       
-      // Get attachments from parsed email
-      const parts = emailMessage.parts || [];
+      const boundary = boundaryMatch[1];
+      debugInfo.push(`Boundary: ${boundary}`);
+      
+      // Split email by boundary
+      const parts = rawEmail.split(`--${boundary}`);
       debugInfo.push(`Email parts: ${parts.length}`);
       
-      const attachments = parts.filter(part => 
-        part.disposition === 'attachment' && 
-        part.filename && 
-        (part.filename.endsWith('.xlsx') || part.filename.endsWith('.xls'))
-      );
+      // Find Excel attachment
+      let excelPart = null;
+      let fileName = null;
       
-      debugInfo.push(`Excel attachments: ${attachments.length}`);
-      
-      if (attachments.length > 0) {
-        attachments.forEach((att, i) => {
-          debugInfo.push(`Attachment ${i + 1}: ${att.filename}`);
-        });
+      for (const part of parts) {
+        if (part.includes('Content-Disposition: attachment') && 
+            (part.includes('.xlsx') || part.includes('.xls'))) {
+          excelPart = part;
+          
+          // Extract filename
+          const fileNameMatch = part.match(/filename="?([^"\r\n]+)"?/);
+          if (fileNameMatch) {
+            fileName = fileNameMatch[1];
+          }
+          break;
+        }
       }
-
-      if (attachments.length === 0) {
-        message.setReject(`DEBUG: No Excel file found. ${debugInfo.join(' | ')}`);
+      
+      if (!excelPart || !fileName) {
+        message.setReject(`DEBUG: No Excel attachment found. ${debugInfo.join(' | ')}`);
         return;
       }
-
-      const excelAttachment = attachments[0];
-      debugInfo.push(`Excel found: ${excelAttachment.filename}`);
-
-      // Read attachment data
-      const arrayBuffer = await excelAttachment.arrayBuffer();
-      debugInfo.push(`ArrayBuffer size: ${arrayBuffer.byteLength}`);
+      
+      debugInfo.push(`Excel found: ${fileName}`);
+      
+      // Extract base64 data
+      const lines = excelPart.split('\r\n');
+      let base64Data = '';
+      let inData = false;
+      
+      for (const line of lines) {
+        if (line.trim() === '') {
+          inData = true;
+          continue;
+        }
+        if (inData && !line.startsWith('--')) {
+          base64Data += line.trim();
+        }
+      }
+      
+      debugInfo.push(`Base64 length: ${base64Data.length}`);
+      
+      // Decode base64 to ArrayBuffer
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+      }
+      
+      debugInfo.push(`ArrayBuffer size: ${bytes.length}`);
       
       // Parse Excel
-      const workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
+      const workbook = XLSX.read(bytes, { type: 'array' });
       const sheetName = workbook.SheetNames[0];
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       debugInfo.push(`Parsed ${rawData.length} rows`);
 
       // Detect state
-      const fileName = excelAttachment.filename.toLowerCase();
       let state = 'Nevada';
       
-      if (fileName.includes('utah') || fileName.includes('ut')) {
+      if (fileName.toLowerCase().includes('utah') || fileName.toLowerCase().includes('ut')) {
         state = 'Utah';
-      } else if (fileName.includes('nevada') || fileName.includes('nv')) {
+      } else if (fileName.toLowerCase().includes('nevada') || fileName.toLowerCase().includes('nv')) {
         state = 'Nevada';
       } else {
         const sampleTech = rawData[1]?.[findColumnIndex(rawData[0], 'TECH')];
@@ -85,7 +113,7 @@ export default {
       const rtCol = findColumnIndex(headers, 'RT');
 
       if (dateCol === -1 || techCol === -1) {
-        message.setReject(`DEBUG: Missing columns. ${debugInfo.join(' | ')}`);
+        message.setReject(`DEBUG: Missing columns DATE=${dateCol} TECH=${techCol}. ${debugInfo.join(' | ')}`);
         return;
       }
 
@@ -139,7 +167,7 @@ export default {
       
       if (!uploadResponse.ok) {
         const errorText = await uploadResponse.text();
-        message.setReject(`DEBUG: Upload failed ${uploadResponse.status}. ${debugInfo.join(' | ')}`);
+        message.setReject(`DEBUG: Upload failed ${uploadResponse.status} ${errorText}. ${debugInfo.join(' | ')}`);
         return;
       }
 
@@ -147,7 +175,7 @@ export default {
       message.setReject(`SUCCESS: Uploaded ${scheduleData.length} ${state} entries. ${debugInfo.join(' | ')}`);
 
     } catch (error) {
-      message.setReject(`DEBUG ERROR: ${error.message}. ${debugInfo.join(' | ')}`);
+      message.setReject(`DEBUG ERROR: ${error.message} at ${error.stack}. ${debugInfo.join(' | ')}`);
     }
   }
 };
