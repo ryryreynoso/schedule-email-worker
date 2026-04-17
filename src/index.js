@@ -53,19 +53,29 @@ export default {
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       
-      // Find header row (look for row containing "DATE" and "TECH")
+      // Find header row - look for row with multiple column-like headers
+      // Common headers: DATE, TECH, TEST, ZIP, IOCS, RT, ROUTE, SCHEDULE
       let headerRowIndex = -1;
       for (let i = 0; i < Math.min(10, rawData.length); i++) {
         const row = rawData[i] || [];
-        const rowStr = row.join('|').toUpperCase();
-        if (rowStr.includes('DATE') && rowStr.includes('TECH')) {
+        if (row.length < 3) continue; // Skip rows with too few columns
+        
+        const rowStr = row.map(cell => String(cell || '').toUpperCase()).join('|');
+        
+        // Look for common schedule headers
+        const hasDate = rowStr.includes('DATE') || rowStr.includes('DAY');
+        const hasTech = rowStr.includes('TECH') || rowStr.includes('NAME') || rowStr.includes('EMPLOYEE');
+        
+        if (hasDate && hasTech) {
           headerRowIndex = i;
           break;
         }
       }
       
       if (headerRowIndex === -1) {
-        message.setReject('Header row not found');
+        // If still not found, show first 5 rows for debugging
+        const debugRows = rawData.slice(0, 5).map((r, i) => `R${i}:${JSON.stringify(r).substring(0, 50)}`).join(' | ');
+        message.setReject(`Headers not found. First rows: ${debugRows}`);
         return;
       }
       
@@ -88,11 +98,11 @@ export default {
       const rtCol = findColumnIndex(headers, 'RT');
       
       if (dateCol === -1 || techCol === -1) {
-        message.setReject(`Cols not found DATE=${dateCol} TECH=${techCol}`);
+        message.setReject(`Cols: DATE=${dateCol} TECH=${techCol} Headers:${JSON.stringify(headers).substring(0, 100)}`);
         return;
       }
       
-      // Parse schedule data (start from row after headers)
+      // Parse schedule data
       const scheduleData = [];
       for (let i = headerRowIndex + 1; i < rawData.length; i++) {
         const row = rawData[i];
