@@ -1,0 +1,7 @@
+name = "schedule-email-worker"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Email binding configuration
+# This tells Cloudflare this is an Email Worker
+[email]
