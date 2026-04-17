@@ -109,7 +109,7 @@ export default {
       if (scheduleData.length === 0) return;
       
       // Upload to Firebase
-      const firebaseUrl = 'https://work-schedule-1f2e1-default-rtdb.firebaseio.com';
+      const firebaseUrl = 'https://work-scheduler-1-default-rtdb.firebaseio.com';
       
       await fetch(`${firebaseUrl}/schedules/${state}.json`, { method: 'DELETE' });
       
