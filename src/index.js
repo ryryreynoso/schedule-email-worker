@@ -91,8 +91,8 @@ export default {
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
       debugInfo.push(`Rows: ${rawData.length}`);
 
-      // Show actual headers for debugging
-      const headers = rawData[0] || [];
+      // Row 0 is title ("NEVADA"), Row 1 is actual headers
+      const headers = rawData[1] || [];
       debugInfo.push(`Headers: ${JSON.stringify(headers).substring(0, 200)}`);
 
       // Detect state
@@ -103,7 +103,7 @@ export default {
       } else if (fileName.toLowerCase().includes('nevada') || fileName.toLowerCase().includes('nv')) {
         state = 'Nevada';
       } else {
-        const sampleTech = rawData[1]?.[findColumnIndex(headers, 'TECH')];
+        const sampleTech = rawData[2]?.[findColumnIndex(headers, 'TECH')];
         if (sampleTech && sampleTech.length > 3) {
           state = 'Utah';
         }
@@ -124,9 +124,9 @@ export default {
         return;
       }
 
-      // Parse schedule data
+      // Parse schedule data (start from row 2, skip title and header rows)
       const scheduleData = [];
-      for (let i = 1; i < rawData.length; i++) {
+      for (let i = 2; i < rawData.length; i++) {
         const row = rawData[i];
         if (!row || row.length === 0) continue;
 
