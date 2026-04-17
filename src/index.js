@@ -9,10 +9,30 @@ export default {
       debugInfo.push(`From: ${message.from}`);
       debugInfo.push(`Subject: ${message.headers.get('subject')}`);
       
-      // Get Excel attachment - FIXED: message.attachments is async iterable
-      const attachments = [];
-      for await (const att of message.attachments) {
-        attachments.push(att);
+      // Try to get raw message first
+      const rawEmail = await new Response(message.raw).text();
+      debugInfo.push(`Raw email size: ${rawEmail.length}`);
+      
+      // Get Excel attachment - Try different approach
+      let attachments = [];
+      
+      // Check if attachments property exists
+      if (message.attachments) {
+        debugInfo.push('Attachments property exists');
+        try {
+          // Try as async iterable
+          for await (const att of message.attachments) {
+            attachments.push(att);
+          }
+        } catch (e) {
+          debugInfo.push(`Async iteration failed: ${e.message}`);
+          // Try as regular array
+          if (Array.isArray(message.attachments)) {
+            attachments = message.attachments;
+          }
+        }
+      } else {
+        debugInfo.push('No attachments property');
       }
       
       debugInfo.push(`Total attachments: ${attachments.length}`);
@@ -24,7 +44,7 @@ export default {
       }
       
       const excelAttachment = attachments.find(att => 
-        att.name.endsWith('.xlsx') || att.name.endsWith('.xls')
+        att.name && (att.name.endsWith('.xlsx') || att.name.endsWith('.xls'))
       );
 
       if (!excelAttachment) {
