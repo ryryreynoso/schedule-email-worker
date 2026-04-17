@@ -3,32 +3,46 @@ import * as XLSX from 'xlsx';
 export default {
   async email(message, env, ctx) {
     try {
-      console.log('Email received from:', message.from);
+      console.log('=== EMAIL RECEIVED ===');
+      console.log('From:', message.from);
       console.log('Subject:', message.headers.get('subject'));
       
       // Get Excel attachment
+      console.log('Checking for attachments...');
       const attachments = [...message.attachments];
+      console.log('Total attachments:', attachments.length);
+      
+      if (attachments.length > 0) {
+        attachments.forEach((att, i) => {
+          console.log(`Attachment ${i + 1}: ${att.name}`);
+        });
+      }
+      
       const excelAttachment = attachments.find(att => 
         att.name.endsWith('.xlsx') || att.name.endsWith('.xls')
       );
 
       if (!excelAttachment) {
-        console.log('No Excel file found in email');
+        console.log('❌ No Excel file found in email');
         return;
       }
 
-      console.log('Excel file found:', excelAttachment.name);
+      console.log('✅ Excel file found:', excelAttachment.name);
 
       // Read attachment as ArrayBuffer
+      console.log('Reading attachment stream...');
       const arrayBuffer = await streamToArrayBuffer(excelAttachment);
+      console.log('ArrayBuffer size:', arrayBuffer.byteLength);
       
       // Parse Excel
+      console.log('Parsing Excel...');
       const workbook = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array' });
       const sheetName = workbook.SheetNames[0];
+      console.log('Sheet name:', sheetName);
+      
       const sheet = workbook.Sheets[sheetName];
       const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-
-      console.log('Parsed rows:', rawData.length);
+      console.log('✅ Parsed rows:', rawData.length);
 
       // Detect state (Nevada or Utah)
       const fileName = excelAttachment.name.toLowerCase();
@@ -46,10 +60,12 @@ export default {
         }
       }
 
-      console.log('Detected state:', state);
+      console.log('✅ Detected state:', state);
 
       // Find column indices
       const headers = rawData[0] || [];
+      console.log('Headers:', headers);
+      
       const dateCol = findColumnIndex(headers, 'DATE');
       const techCol = findColumnIndex(headers, 'TECH');
       const testCol = findColumnIndex(headers, 'TEST');
@@ -57,8 +73,10 @@ export default {
       const iocsCol = findColumnIndex(headers, 'IOCS');
       const rtCol = findColumnIndex(headers, 'RT');
 
+      console.log('Column indices - DATE:', dateCol, 'TECH:', techCol);
+
       if (dateCol === -1 || techCol === -1) {
-        console.error('Could not find DATE or TECH columns');
+        console.error('❌ Could not find DATE or TECH columns');
         return;
       }
 
@@ -87,37 +105,45 @@ export default {
         });
       }
 
-      console.log('Parsed schedule entries:', scheduleData.length);
+      console.log('✅ Parsed schedule entries:', scheduleData.length);
 
       if (scheduleData.length === 0) {
-        console.error('No valid schedule data found in Excel file');
+        console.error('❌ No valid schedule data found');
         return;
       }
 
       // Upload to Firebase
       const firebaseUrl = 'https://work-scheduler-1-default-rtdb.firebaseio.com';
+      console.log('Uploading to Firebase...');
       
       // Delete old state data
       const deleteUrl = `${firebaseUrl}/schedules/${state}.json`;
+      console.log('Deleting old data:', deleteUrl);
       const deleteResponse = await fetch(deleteUrl, { method: 'DELETE' });
-      console.log('Deleted old data:', deleteResponse.ok);
+      console.log('Delete response:', deleteResponse.ok);
 
       // Upload new data
       const uploadUrl = `${firebaseUrl}/schedules/${state}.json`;
+      console.log('Uploading new data:', uploadUrl);
       const uploadResponse = await fetch(uploadUrl, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(scheduleData)
       });
 
+      console.log('Upload response status:', uploadResponse.status);
+      
       if (!uploadResponse.ok) {
+        const errorText = await uploadResponse.text();
+        console.error('❌ Firebase upload failed:', uploadResponse.status, errorText);
         throw new Error(`Firebase upload failed: ${uploadResponse.status}`);
       }
 
-      console.log('✅ Upload successful:', scheduleData.length, state, 'entries');
+      console.log('✅✅✅ Upload successful:', scheduleData.length, state, 'entries');
 
     } catch (error) {
-      console.error('❌ Error processing email:', error);
+      console.error('❌❌❌ Error processing email:', error.message);
+      console.error('Stack:', error.stack);
     }
   }
 };
