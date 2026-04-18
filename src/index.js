@@ -63,6 +63,27 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// NEW: Batch write function using Firestore's commit API
+async function batchWriteFirestore(projectId, accessToken, writes) {
+  const batchUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:commit`;
+  
+  const response = await fetch(batchUrl, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ writes })
+  });
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Batch write failed: ${response.status} - ${errorText}`);
+  }
+  
+  return await response.json();
+}
+
 export default {
   async email(message, env, ctx) {
     try {
@@ -179,9 +200,11 @@ export default {
       const accessToken = await getAccessToken();
       const projectId = 'work-schedule-1f2e1';
       
+      // STEP 1: Get all existing documents for this state
+      console.log(`📋 Fetching existing ${state} documents...`);
       const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows?pageSize=1000`;
       
-      let deletedCount = 0;
+      let docsToDelete = [];
       let pageToken = '';
       
       do {
@@ -194,71 +217,81 @@ export default {
         const listData = await listResponse.json();
         
         if (listData.documents) {
-          const deletePromises = [];
           for (const doc of listData.documents) {
             if (doc.name.includes('/schedule/current/rows/') && 
                 doc.fields?.state?.stringValue === state) {
-              deletePromises.push(
-                fetch(`https://firestore.googleapis.com/v1/${doc.name}`, {
-                  method: 'DELETE',
-                  headers: { 'Authorization': `Bearer ${accessToken}` }
-                })
-              );
+              docsToDelete.push(doc.name);
             }
-          }
-          
-          if (deletePromises.length > 0) {
-            await Promise.all(deletePromises);
-            deletedCount += deletePromises.length;
-            console.log(`Deleted ${deletePromises.length} documents (total: ${deletedCount})`);
           }
         }
         
         pageToken = listData.nextPageToken || '';
       } while (pageToken);
       
-      console.log(`✅ Deletion complete: ${deletedCount} old documents for ${state}`);
+      console.log(`🗑️  Found ${docsToDelete.length} old ${state} documents to delete`);
       
-      const BATCH_SIZE = 50;
-      let uploadedCount = 0;
+      // STEP 2: Prepare batch writes (deletes + creates)
+      // Firestore allows 500 operations per batch
+      const BATCH_SIZE = 500;
+      let totalOperations = 0;
       
-      for (let i = 0; i < scheduleData.length; i += BATCH_SIZE) {
-        const batch = scheduleData.slice(i, i + BATCH_SIZE);
-        const uploadPromises = batch.map(entry => {
-          const docData = {
-            fields: {
-              date: { stringValue: entry.date },
-              person: { stringValue: entry.person },
-              test: { stringValue: entry.test },
-              zipCode: { stringValue: entry.zipCode },
-              testId: { stringValue: entry.testId },
-              location: { stringValue: entry.location },
-              state: { stringValue: entry.state },
-              mep: { stringValue: entry.mep || '' },
-              time: { stringValue: '' }
-            }
-          };
-          
-          return fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows`, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${accessToken}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify(docData)
+      // Process in batches
+      let deleteIndex = 0;
+      let createIndex = 0;
+      let batchNumber = 1;
+      
+      while (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
+        const writes = [];
+        
+        // Add deletes to this batch (up to BATCH_SIZE total operations)
+        while (deleteIndex < docsToDelete.length && writes.length < BATCH_SIZE) {
+          writes.push({
+            delete: docsToDelete[deleteIndex]
           });
-        });
+          deleteIndex++;
+        }
         
-        await Promise.all(uploadPromises);
-        uploadedCount += batch.length;
-        console.log(`Uploaded ${uploadedCount}/${scheduleData.length} documents`);
+        // Add creates to this batch (if space remaining)
+        while (createIndex < scheduleData.length && writes.length < BATCH_SIZE) {
+          const entry = scheduleData[createIndex];
+          
+          writes.push({
+            update: {
+              name: `projects/${projectId}/databases/(default)/documents/schedule/current/rows/${Date.now()}_${createIndex}`,
+              fields: {
+                date: { stringValue: entry.date },
+                person: { stringValue: entry.person },
+                test: { stringValue: entry.test },
+                zipCode: { stringValue: entry.zipCode },
+                testId: { stringValue: entry.testId },
+                location: { stringValue: entry.location },
+                state: { stringValue: entry.state },
+                mep: { stringValue: entry.mep || '' },
+                time: { stringValue: '' }
+              }
+            }
+          });
+          createIndex++;
+        }
         
-        if (i + BATCH_SIZE < scheduleData.length) {
-          await sleep(100);
+        // Execute this batch
+        if (writes.length > 0) {
+          console.log(`📦 Batch ${batchNumber}: Processing ${writes.length} operations...`);
+          await batchWriteFirestore(projectId, accessToken, writes);
+          totalOperations += writes.length;
+          console.log(`✅ Batch ${batchNumber} complete (${totalOperations} total operations)`);
+          batchNumber++;
+          
+          // Small delay between batches to avoid rate limits
+          if (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
+            await sleep(100);
+          }
         }
       }
       
-      // Update metadata document - THIS IS THE KEY PART!
+      console.log(`✅ All batches complete: Deleted ${docsToDelete.length}, Created ${scheduleData.length}`);
+      
+      // STEP 3: Update metadata document
       await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current`, {
         method: 'PATCH',
         headers: {
@@ -268,16 +301,17 @@ export default {
         body: JSON.stringify({
           fields: {
             [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
-            [`${state.toLowerCase()}Count`]: { integerValue: uploadedCount.toString() },
+            [`${state.toLowerCase()}Count`]: { integerValue: scheduleData.length.toString() },
             [`${state.toLowerCase()}Filename`]: { stringValue: fileName }
           }
         })
       });
       
-      console.log(`✅ Upload complete: ${uploadedCount} documents for ${state}`);
+      console.log(`🎉 Upload complete for ${state}: ${scheduleData.length} documents`);
       
     } catch (error) {
       console.error('❌ Error:', error);
+      console.error('Stack:', error.stack);
     }
   }
 };
