@@ -258,6 +258,22 @@ export default {
         }
       }
       
+      // Update metadata document - THIS IS THE KEY PART!
+      await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current`, {
+        method: 'PATCH',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          fields: {
+            [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
+            [`${state.toLowerCase()}Count`]: { integerValue: uploadedCount.toString() },
+            [`${state.toLowerCase()}Filename`]: { stringValue: fileName }
+          }
+        })
+      });
+      
       console.log(`✅ Upload complete: ${uploadedCount} documents for ${state}`);
       
     } catch (error) {
