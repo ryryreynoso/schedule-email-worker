@@ -14,7 +14,6 @@ const SERVICE_ACCOUNT = {
 function normalizePersonName(name) {
   const upper = name.trim().toUpperCase();
   
-  // Map full names to initials
   const nameMap = {
     'JASON': 'JRA',
     'JASON ALVAREZ': 'JRA',
@@ -92,7 +91,6 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// NEW: Batch write function using Firestore's commit API
 async function batchWriteFirestore(projectId, accessToken, writes) {
   const batchUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:commit`;
   
@@ -113,6 +111,232 @@ async function batchWriteFirestore(projectId, accessToken, writes) {
   return await response.json();
 }
 
+// Determine state from filename
+function determineState(fileName) {
+  const lower = fileName.toLowerCase();
+  // Check Utah first (more specific) since "ut" could appear in other contexts
+  if (lower.includes('utah') || /\but\b/.test(lower) || lower.startsWith('ut')) {
+    return 'Utah';
+  }
+  if (lower.includes('nevada') || /\bnv\b/.test(lower) || lower.startsWith('nv')) {
+    return 'Nevada';
+  }
+  // Default to Nevada if unclear
+  return 'Nevada';
+}
+
+// Parse a single Excel attachment and return scheduleData
+function parseExcelAttachment(bytes, state) {
+  const workbook = XLSX.read(bytes, { type: 'array' });
+  const scheduleData = [];
+  let totalRowsParsed = 0;
+  
+  console.log(`Total sheets: ${workbook.SheetNames.length}`);
+  
+  for (const sheetName of workbook.SheetNames) {
+    console.log(`Processing sheet: ${sheetName}`);
+    const sheet = workbook.Sheets[sheetName];
+    const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+    
+    let currentDate = null;
+    let rowsInSheet = 0;
+    
+    for (let i = 0; i < rawData.length; i++) {
+      const row = rawData[i];
+      if (!row || row.length === 0) continue;
+      
+      const firstCell = String(row[0] || '').trim();
+      
+      if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
+        const dateMatch = firstCell.match(/(\d{1,2})-(\d{1,2})-(\d{2})/);
+        if (dateMatch) {
+          const mm = dateMatch[1].padStart(2, '0');
+          const dd = dateMatch[2].padStart(2, '0');
+          const yy = dateMatch[3];
+          currentDate = `20${yy}-${mm}-${dd}`;
+          console.log(`Found date: ${currentDate}`);
+        }
+        continue;
+      }
+      
+      if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'UTAH' || firstCell === 'TEST SCHEDULE') {
+        continue;
+      }
+      
+      if (currentDate && row.length >= 6) {
+        const testName = String(row[0] || '').trim();
+        const zip = String(row[1] || '').trim();
+        const site = String(row[2] || '').trim();
+        const type = String(row[3] || '').trim();
+        const testId = String(row[4] || '').trim();
+        const tech = String(row[5] || '').trim();
+        
+        if (tech && tech !== 'TECH(S)' && testName && testName !== 'ZIP CODES') {
+          const normalizedPerson = normalizePersonName(tech);
+          totalRowsParsed++;
+          
+          if (totalRowsParsed <= 5) {
+            console.log(`   Row ${i}: ${tech} → ${normalizedPerson} | ${testName}`);
+          }
+          
+          scheduleData.push({
+            date: currentDate,
+            person: normalizedPerson,
+            test: testName,
+            zipCode: zip,
+            testId: testId,
+            location: site,
+            mep: type,
+            state: state
+          });
+          rowsInSheet++;
+        }
+      }
+    }
+    console.log(`Sheet ${sheetName}: Added ${rowsInSheet} rows`);
+  }
+  
+  return scheduleData;
+}
+
+// Decode a single MIME part's body to a Uint8Array
+function decodeAttachmentPart(part) {
+  const headerEndIndex = part.indexOf('\r\n\r\n');
+  if (headerEndIndex === -1) return null;
+  
+  const dataSection = part.substring(headerEndIndex + 4);
+  const base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
+  
+  try {
+    const binaryString = atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
+  } catch (e) {
+    console.error('Failed to decode base64:', e.message);
+    return null;
+  }
+}
+
+// Process one Excel file end-to-end (parse + delete old + upload new + update metadata)
+async function processExcelFile(fileName, bytes, projectId, accessToken) {
+  const state = determineState(fileName);
+  console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  console.log(`📂 Processing ${state} file: ${fileName}`);
+  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  
+  const scheduleData = parseExcelAttachment(bytes, state);
+  console.log(`Total entries parsed: ${scheduleData.length}`);
+  
+  if (scheduleData.length === 0) {
+    console.log(`⚠️  No entries parsed from ${fileName} — skipping`);
+    return { state, fileName, count: 0, status: 'skipped' };
+  }
+  
+  // STEP 1: Get all existing documents for this state
+  console.log(`📋 Fetching existing ${state} documents...`);
+  const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows?pageSize=1000`;
+  
+  const docsToDelete = [];
+  let pageToken = '';
+  
+  do {
+    const url = pageToken ? `${listUrl}&pageToken=${pageToken}` : listUrl;
+    const listResponse = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${accessToken}` }
+    });
+    
+    const listData = await listResponse.json();
+    
+    if (listData.documents) {
+      for (const doc of listData.documents) {
+        if (doc.name.includes('/schedule/current/rows/') && 
+            doc.fields?.state?.stringValue === state) {
+          docsToDelete.push(doc.name);
+        }
+      }
+    }
+    
+    pageToken = listData.nextPageToken || '';
+  } while (pageToken);
+  
+  console.log(`🗑️  Found ${docsToDelete.length} old ${state} documents to delete`);
+  
+  // STEP 2: Batch deletes + creates
+  const BATCH_SIZE = 500;
+  let totalOperations = 0;
+  let deleteIndex = 0;
+  let createIndex = 0;
+  let batchNumber = 1;
+  
+  while (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
+    const writes = [];
+    
+    while (deleteIndex < docsToDelete.length && writes.length < BATCH_SIZE) {
+      writes.push({ delete: docsToDelete[deleteIndex] });
+      deleteIndex++;
+    }
+    
+    while (createIndex < scheduleData.length && writes.length < BATCH_SIZE) {
+      const entry = scheduleData[createIndex];
+      
+      writes.push({
+        update: {
+          name: `projects/${projectId}/databases/(default)/documents/schedule/current/rows/doc_${Date.now()}_${createIndex}_${Math.floor(Math.random() * 10000)}`,
+          fields: {
+            date: { stringValue: String(entry.date || '') },
+            person: { stringValue: String(entry.person || '') },
+            test: { stringValue: String(entry.test || '') },
+            zipCode: { stringValue: String(entry.zipCode || '') },
+            testId: { stringValue: String(entry.testId || '') },
+            location: { stringValue: String(entry.location || '') },
+            state: { stringValue: String(entry.state || '') },
+            mep: { stringValue: String(entry.mep || '') },
+            time: { stringValue: '' }
+          }
+        }
+      });
+      createIndex++;
+    }
+    
+    if (writes.length > 0) {
+      console.log(`📦 [${state}] Batch ${batchNumber}: ${writes.length} operations...`);
+      await batchWriteFirestore(projectId, accessToken, writes);
+      totalOperations += writes.length;
+      console.log(`✅ [${state}] Batch ${batchNumber} complete (${totalOperations} total)`);
+      batchNumber++;
+      
+      if (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
+        await sleep(100);
+      }
+    }
+  }
+  
+  console.log(`✅ ${state}: Deleted ${docsToDelete.length}, Created ${scheduleData.length}`);
+  
+  // STEP 3: Update metadata for this state
+  await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current`, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      fields: {
+        [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
+        [`${state.toLowerCase()}Count`]: { integerValue: scheduleData.length.toString() },
+        [`${state.toLowerCase()}Filename`]: { stringValue: fileName }
+      }
+    })
+  });
+  
+  console.log(`🎉 ${state} upload complete: ${scheduleData.length} documents`);
+  return { state, fileName, count: scheduleData.length, status: 'success' };
+}
+
 export default {
   async email(message, env, ctx) {
     try {
@@ -120,243 +344,73 @@ export default {
       
       const contentType = message.headers.get('content-type') || '';
       const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
-      if (!boundaryMatch) return;
+      if (!boundaryMatch) {
+        console.error('❌ NO MIME BOUNDARY FOUND');
+        return;
+      }
       
       const boundary = boundaryMatch[1];
       const parts = rawEmail.split(`--${boundary}`);
       
-      let excelPart = null;
-      let fileName = null;
+      // Collect ALL Excel attachments (not just the first one)
+      const attachments = [];
       
       for (const part of parts) {
         if (part.includes('Content-Disposition: attachment') && 
             (part.includes('.xlsx') || part.includes('.xls'))) {
-          excelPart = part;
           const fileNameMatch = part.match(/filename="?([^"\r\n]+)"?/);
-          if (fileNameMatch) fileName = fileNameMatch[1];
-          break;
+          if (!fileNameMatch) continue;
+          const fileName = fileNameMatch[1];
+          
+          attachments.push({ part, fileName });
+          console.log(`✅ Found attachment: ${fileName} (${part.length} bytes)`);
         }
       }
       
-      if (!excelPart) {
-        console.error('❌ NO EXCEL ATTACHMENT FOUND');
-        return;
-      }
-      if (!fileName) {
-        console.error('❌ NO FILENAME DETECTED');
+      if (attachments.length === 0) {
+        console.error('❌ NO EXCEL ATTACHMENTS FOUND');
         return;
       }
       
-      console.log('✅ File detected:', fileName);
-      console.log('   Size:', excelPart.length, 'bytes');
-      
-      const headerEndIndex = excelPart.indexOf('\r\n\r\n');
-      if (headerEndIndex === -1) return;
-      
-      const dataSection = excelPart.substring(headerEndIndex + 4);
-      let base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
-      
-      const binaryString = atob(base64Data);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      
-      const workbook = XLSX.read(bytes, { type: 'array' });
-      
-      let state = 'Nevada';
-      if (fileName.toLowerCase().includes('utah') || fileName.toLowerCase().includes('ut')) {
-        state = 'Utah';
-      } else if (fileName.toLowerCase().includes('nevada') || fileName.toLowerCase().includes('nv')) {
-        state = 'Nevada';
-      }
-      
-      console.log(`Processing ${state} file: ${fileName}`);
-      console.log(`Total sheets: ${workbook.SheetNames.length}`);
-      
-      const scheduleData = [];
-      
-      for (const sheetName of workbook.SheetNames) {
-        console.log(`Processing sheet: ${sheetName}`);
-        const sheet = workbook.Sheets[sheetName];
-        const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-        
-        let currentDate = null;
-        let rowsInSheet = 0;
-        
-        for (let i = 0; i < rawData.length; i++) {
-          const row = rawData[i];
-          if (!row || row.length === 0) continue;
-          
-          const firstCell = String(row[0] || '').trim();
-          
-          if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
-            const dateMatch = firstCell.match(/(\d{1,2})-(\d{1,2})-(\d{2})/);
-            if (dateMatch) {
-              const mm = dateMatch[1].padStart(2, '0');
-              const dd = dateMatch[2].padStart(2, '0');
-              const yy = dateMatch[3];
-              currentDate = `20${yy}-${mm}-${dd}`;
-              console.log(`Found date: ${currentDate}`);
-            }
-            continue;
-          }
-          
-          if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'UTAH' || firstCell === 'TEST SCHEDULE') {
-            continue;
-          }
-          
-          if (currentDate && row.length >= 6) {
-            const testName = String(row[0] || '').trim();
-            const zip = String(row[1] || '').trim();
-            const site = String(row[2] || '').trim();
-            const type = String(row[3] || '').trim();
-            const testId = String(row[4] || '').trim();
-            const tech = String(row[5] || '').trim();
-            
-            if (tech && tech !== 'TECH(S)' && testName && testName !== 'ZIP CODES') {
-              const normalizedPerson = normalizePersonName(tech);
-              totalRowsParsed++;
-              
-              if (totalRowsParsed <= 5) {
-                console.log(\`   Row \${i}: \${tech} → \${normalizedPerson} | \${testName}\`);
-              }
-              
-              scheduleData.push({
-                date: currentDate,
-                person: normalizedPerson,
-                test: testName,
-                zipCode: zip,
-                testId: testId,
-                location: site,
-                mep: type,
-                state: state
-              });
-              rowsInSheet++;
-            }
-          }
-        }
-        console.log(`Sheet ${sheetName}: Added ${rowsInSheet} rows`);
-      }
-      
-      console.log(`Total entries parsed: ${scheduleData.length}`);
-      
-      if (scheduleData.length === 0) return;
+      console.log(`\n📬 Email contains ${attachments.length} Excel attachment(s)`);
       
       const accessToken = await getAccessToken();
       const projectId = 'work-schedule-1f2e1';
+      const results = [];
       
-      // STEP 1: Get all existing documents for this state
-      console.log(`📋 Fetching existing ${state} documents...`);
-      const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows?pageSize=1000`;
-      
-      let docsToDelete = [];
-      let pageToken = '';
-      
-      do {
-        const url = pageToken ? `${listUrl}&pageToken=${pageToken}` : listUrl;
-        const listResponse = await fetch(url, {
-          method: 'GET',
-          headers: { 'Authorization': `Bearer ${accessToken}` }
-        });
-        
-        const listData = await listResponse.json();
-        
-        if (listData.documents) {
-          for (const doc of listData.documents) {
-            if (doc.name.includes('/schedule/current/rows/') && 
-                doc.fields?.state?.stringValue === state) {
-              docsToDelete.push(doc.name);
-            }
+      // Process each attachment sequentially
+      for (const { part, fileName } of attachments) {
+        try {
+          const bytes = decodeAttachmentPart(part);
+          if (!bytes) {
+            console.error(`❌ Failed to decode ${fileName}`);
+            results.push({ fileName, status: 'decode_failed' });
+            continue;
           }
-        }
-        
-        pageToken = listData.nextPageToken || '';
-      } while (pageToken);
-      
-      console.log(`🗑️  Found ${docsToDelete.length} old ${state} documents to delete`);
-      
-      // STEP 2: Prepare batch writes (deletes + creates)
-      // Firestore allows 500 operations per batch
-      const BATCH_SIZE = 500;
-      let totalOperations = 0;
-      
-      // Process in batches
-      let deleteIndex = 0;
-      let createIndex = 0;
-      let batchNumber = 1;
-      
-      while (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
-        const writes = [];
-        
-        // Add deletes to this batch (up to BATCH_SIZE total operations)
-        while (deleteIndex < docsToDelete.length && writes.length < BATCH_SIZE) {
-          writes.push({
-            delete: docsToDelete[deleteIndex]
-          });
-          deleteIndex++;
-        }
-        
-        // Add creates to this batch (if space remaining)
-        while (createIndex < scheduleData.length && writes.length < BATCH_SIZE) {
-          const entry = scheduleData[createIndex];
           
-          writes.push({
-            update: {
-              name: `projects/${projectId}/databases/(default)/documents/schedule/current/rows/doc_${Date.now()}_${createIndex}_${Math.floor(Math.random() * 10000)}`,
-              fields: {
-                date: { stringValue: String(entry.date || '') },
-                person: { stringValue: String(entry.person || '') },
-                test: { stringValue: String(entry.test || '') },
-                zipCode: { stringValue: String(entry.zipCode || '') },
-                testId: { stringValue: String(entry.testId || '') },
-                location: { stringValue: String(entry.location || '') },
-                state: { stringValue: String(entry.state || '') },
-                mep: { stringValue: String(entry.mep || '') },
-                time: { stringValue: '' }
-              }
-            }
-          });
-          createIndex++;
-        }
-        
-        // Execute this batch
-        if (writes.length > 0) {
-          console.log(`📦 Batch ${batchNumber}: Processing ${writes.length} operations...`);
-          await batchWriteFirestore(projectId, accessToken, writes);
-          totalOperations += writes.length;
-          console.log(`✅ Batch ${batchNumber} complete (${totalOperations} total operations)`);
-          batchNumber++;
-          
-          // Small delay between batches to avoid rate limits
-          if (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
-            await sleep(100);
-          }
+          const result = await processExcelFile(fileName, bytes, projectId, accessToken);
+          results.push(result);
+        } catch (fileError) {
+          console.error(`❌ Error processing ${fileName}:`, fileError.message);
+          console.error('Stack:', fileError.stack);
+          results.push({ fileName, status: 'error', error: fileError.message });
+          // Continue with other files even if one fails
         }
       }
       
-      console.log(`✅ All batches complete: Deleted ${docsToDelete.length}, Created ${scheduleData.length}`);
-      
-      // STEP 3: Update metadata document
-      await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current`, {
-        method: 'PATCH',
-        headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          fields: {
-            [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
-            [`${state.toLowerCase()}Count`]: { integerValue: scheduleData.length.toString() },
-            [`${state.toLowerCase()}Filename`]: { stringValue: fileName }
-          }
-        })
-      });
-      
-      console.log(`🎉 Upload complete for ${state}: ${scheduleData.length} documents`);
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`📊 SUMMARY:`);
+      for (const r of results) {
+        if (r.status === 'success') {
+          console.log(`   ✅ ${r.state}: ${r.count} entries (${r.fileName})`);
+        } else {
+          console.log(`   ❌ ${r.fileName}: ${r.status}${r.error ? ' — ' + r.error : ''}`);
+        }
+      }
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
       
     } catch (error) {
-      console.error('❌ Error:', error);
+      console.error('❌ Top-level error:', error);
       console.error('Stack:', error.stack);
     }
   }
