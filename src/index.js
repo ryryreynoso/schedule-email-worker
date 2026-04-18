@@ -138,7 +138,17 @@ export default {
         }
       }
       
-      if (!excelPart || !fileName) return;
+      if (!excelPart) {
+        console.error('❌ NO EXCEL ATTACHMENT FOUND');
+        return;
+      }
+      if (!fileName) {
+        console.error('❌ NO FILENAME DETECTED');
+        return;
+      }
+      
+      console.log('✅ File detected:', fileName);
+      console.log('   Size:', excelPart.length, 'bytes');
       
       const headerEndIndex = excelPart.indexOf('\r\n\r\n');
       if (headerEndIndex === -1) return;
@@ -206,6 +216,12 @@ export default {
             
             if (tech && tech !== 'TECH(S)' && testName && testName !== 'ZIP CODES') {
               const normalizedPerson = normalizePersonName(tech);
+              totalRowsParsed++;
+              
+              if (totalRowsParsed <= 5) {
+                console.log(\`   Row \${i}: \${tech} → \${normalizedPerson} | \${testName}\`);
+              }
+              
               scheduleData.push({
                 date: currentDate,
                 person: normalizedPerson,
