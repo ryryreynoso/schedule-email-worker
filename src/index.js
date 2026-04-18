@@ -9,33 +9,9 @@ const SERVICE_ACCOUNT = {
   token_uri: "https://oauth2.googleapis.com/token"
 };
 
+const PROJECT_ID = 'work-schedule-1f2e1';
 
-// Normalize tech names to initials for Nevada
-function normalizePersonName(name) {
-  const upper = name.trim().toUpperCase();
-  
-  const nameMap = {
-    'JASON': 'JRA',
-    'JASON ALVAREZ': 'JRA',
-    'JERRY': 'JA', 
-    'JERRY ANGLO': 'JA',
-    'JEFF': 'JN',
-    'JEFF NIZNICK': 'JN',
-    'GRACE': 'GA',
-    'GRACE AGRESOR': 'GA',
-    'SHEILA': 'SV',
-    'SHEILA VELASQUEZ': 'SV',
-    'RYAN': 'RR',
-    'RYAN REYNOSO': 'RR',
-    'CHRISTIAN': 'CA',
-    'CHRISTIAN ALBERT': 'CA',
-    'KRISTINE': 'KK',
-    'KRISTINE KIESLING': 'KK',
-    'BUDD': 'KK'
-  };
-  
-  return nameMap[upper] || upper;
-}
+// ─── Auth ───────────────────────────────────────────────────────────
 
 async function getAccessToken() {
   const jwtHeader = btoa(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
@@ -47,9 +23,9 @@ async function getAccessToken() {
     exp: now + 3600,
     iat: now
   }));
-  
+
   const unsignedToken = `${jwtHeader}.${jwtClaimSet}`;
-  
+
   const pemHeader = "-----BEGIN PRIVATE KEY-----";
   const pemFooter = "-----END PRIVATE KEY-----";
   const pemContents = SERVICE_ACCOUNT.private_key.substring(
@@ -57,7 +33,7 @@ async function getAccessToken() {
     SERVICE_ACCOUNT.private_key.length - pemFooter.length - 1
   );
   const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
-  
+
   const key = await crypto.subtle.importKey(
     'pkcs8',
     binaryDer,
@@ -65,24 +41,24 @@ async function getAccessToken() {
     false,
     ['sign']
   );
-  
+
   const signature = await crypto.subtle.sign(
     'RSASSA-PKCS1-v1_5',
     key,
     new TextEncoder().encode(unsignedToken)
   );
-  
+
   const signatureBase64 = btoa(String.fromCharCode(...new Uint8Array(signature)))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-  
+
   const jwt = `${unsignedToken}.${signatureBase64}`;
-  
+
   const tokenResponse = await fetch(SERVICE_ACCOUNT.token_uri, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion=${jwt}`
   });
-  
+
   const tokenData = await tokenResponse.json();
   return tokenData.access_token;
 }
@@ -91,9 +67,11 @@ async function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-async function batchWriteFirestore(projectId, accessToken, writes) {
-  const batchUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents:commit`;
-  
+// ─── Firestore helpers ──────────────────────────────────────────────
+
+async function batchWriteFirestore(accessToken, writes) {
+  const batchUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents:commit`;
+
   const response = await fetch(batchUrl, {
     method: 'POST',
     headers: {
@@ -102,51 +80,133 @@ async function batchWriteFirestore(projectId, accessToken, writes) {
     },
     body: JSON.stringify({ writes })
   });
-  
+
   if (!response.ok) {
     const errorText = await response.text();
     throw new Error(`Batch write failed: ${response.status} - ${errorText}`);
   }
-  
   return await response.json();
 }
 
-// Determine state from filename
-function determineState(fileName) {
-  const lower = fileName.toLowerCase();
-  // Check Utah first (more specific) since "ut" could appear in other contexts
-  if (lower.includes('utah') || /\but\b/.test(lower) || lower.startsWith('ut')) {
-    return 'Utah';
-  }
-  if (lower.includes('nevada') || /\bnv\b/.test(lower) || lower.startsWith('nv')) {
-    return 'Nevada';
-  }
-  // Default to Nevada if unclear
-  return 'Nevada';
+async function listCollectionDocs(accessToken, collectionPath, filterFn) {
+  const listUrl = `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/${collectionPath}?pageSize=1000`;
+  const docs = [];
+  let pageToken = '';
+
+  do {
+    const url = pageToken ? `${listUrl}&pageToken=${pageToken}` : listUrl;
+    const res = await fetch(url, { headers: { 'Authorization': `Bearer ${accessToken}` } });
+    const data = await res.json();
+
+    if (data.documents) {
+      for (const doc of data.documents) {
+        if (!filterFn || filterFn(doc)) docs.push(doc.name);
+      }
+    }
+    pageToken = data.nextPageToken || '';
+  } while (pageToken);
+
+  return docs;
 }
 
-// Parse a single Excel attachment and return scheduleData
-function parseExcelAttachment(bytes, state) {
+async function runBatchedWrites(accessToken, deletes, creates, label) {
+  const BATCH_SIZE = 500;
+  let delIdx = 0, createIdx = 0, batchNum = 1, total = 0;
+
+  while (delIdx < deletes.length || createIdx < creates.length) {
+    const writes = [];
+    while (delIdx < deletes.length && writes.length < BATCH_SIZE) {
+      writes.push({ delete: deletes[delIdx++] });
+    }
+    while (createIdx < creates.length && writes.length < BATCH_SIZE) {
+      writes.push(creates[createIdx++]);
+    }
+    if (writes.length === 0) break;
+
+    console.log(`📦 [${label}] Batch ${batchNum}: ${writes.length} ops`);
+    await batchWriteFirestore(accessToken, writes);
+    total += writes.length;
+    batchNum++;
+    if (delIdx < deletes.length || createIdx < creates.length) await sleep(100);
+  }
+  console.log(`✅ [${label}] ${deletes.length} deleted, ${creates.length} created (${total} total ops)`);
+}
+
+// ─── File type detection ────────────────────────────────────────────
+
+function classifyWorkbook(workbook, fileName) {
+  const fn = fileName.toLowerCase();
+
+  // Filename-based IOCS detection
+  if (fn.includes('iocs') || fn.includes('daily_iocs') || fn.includes('daily iocs')) {
+    return { kind: 'iocs' };
+  }
+
+  // Content-based IOCS detection: sheets with "ASSIGNED DCT" header
+  const sheetNames = workbook.SheetNames;
+  let looksLikeIocs = false;
+  for (const sheetName of sheetNames) {
+    if (sheetName === 'BLANK' || sheetName === 'Sheet2') continue;
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    if (rows.length < 2) continue;
+    for (let i = 0; i < Math.min(3, rows.length); i++) {
+      const rowStr = (rows[i] || []).map(c => String(c || '').toUpperCase()).join('|');
+      if (rowStr.includes('ASSIGNED DCT') || rowStr.includes('IOCS READINGS')) {
+        looksLikeIocs = true;
+        break;
+      }
+    }
+    if (looksLikeIocs) break;
+  }
+  if (looksLikeIocs) return { kind: 'iocs' };
+
+  // Schedule file — determine state
+  if (fn.includes('utah') || /\but\b/.test(fn) || fn.startsWith('ut')) {
+    return { kind: 'schedule', state: 'Utah' };
+  }
+  if (fn.includes('nevada') || /\bnv\b/.test(fn) || fn.startsWith('nv')) {
+    return { kind: 'schedule', state: 'Nevada' };
+  }
+  return { kind: 'schedule', state: 'Nevada' };
+}
+
+// ─── Schedule parser ────────────────────────────────────────────────
+
+function normalizePersonName(name) {
+  const upper = name.trim().toUpperCase();
+  const nameMap = {
+    'JASON': 'JRA', 'JASON ALVAREZ': 'JRA',
+    'JERRY': 'JA', 'JERRY ANGLO': 'JA',
+    'JEFF': 'JN', 'JEFF NIZNICK': 'JN',
+    'GRACE': 'GA', 'GRACE AGRESOR': 'GA',
+    'SHEILA': 'SV', 'SHEILA VELASQUEZ': 'SV',
+    'RYAN': 'RR', 'RYAN REYNOSO': 'RR',
+    'CHRISTIAN': 'CA', 'CHRISTIAN ALBERT': 'CA',
+    'KRISTINE': 'KK', 'KRISTINE KIESLING': 'KK', 'BUDD': 'KK'
+  };
+  return nameMap[upper] || upper;
+}
+
+function parseScheduleExcel(bytes, state) {
   const workbook = XLSX.read(bytes, { type: 'array' });
   const scheduleData = [];
   let totalRowsParsed = 0;
-  
-  console.log(`Total sheets: ${workbook.SheetNames.length}`);
-  
+
   for (const sheetName of workbook.SheetNames) {
-    console.log(`Processing sheet: ${sheetName}`);
+    console.log(`[SCHEDULE/${state}] Sheet: ${sheetName}`);
     const sheet = workbook.Sheets[sheetName];
     const rawData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-    
+
     let currentDate = null;
     let rowsInSheet = 0;
-    
+
     for (let i = 0; i < rawData.length; i++) {
       const row = rawData[i];
       if (!row || row.length === 0) continue;
-      
+
       const firstCell = String(row[0] || '').trim();
-      
+
       if (firstCell.match(/^(MON|TUE|WED|THU|FRI|SAT|SUN)/i)) {
         const dateMatch = firstCell.match(/(\d{1,2})-(\d{1,2})-(\d{2})/);
         if (dateMatch) {
@@ -154,15 +214,12 @@ function parseExcelAttachment(bytes, state) {
           const dd = dateMatch[2].padStart(2, '0');
           const yy = dateMatch[3];
           currentDate = `20${yy}-${mm}-${dd}`;
-          console.log(`Found date: ${currentDate}`);
         }
         continue;
       }
-      
-      if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'UTAH' || firstCell === 'TEST SCHEDULE') {
-        continue;
-      }
-      
+
+      if (firstCell === 'ZIP CODES' || firstCell === 'NEVADA' || firstCell === 'UTAH' || firstCell === 'TEST SCHEDULE') continue;
+
       if (currentDate && row.length >= 6) {
         const testName = String(row[0] || '').trim();
         const zip = String(row[1] || '').trim();
@@ -170,15 +227,13 @@ function parseExcelAttachment(bytes, state) {
         const type = String(row[3] || '').trim();
         const testId = String(row[4] || '').trim();
         const tech = String(row[5] || '').trim();
-        
+
         if (tech && tech !== 'TECH(S)' && testName && testName !== 'ZIP CODES') {
           const normalizedPerson = normalizePersonName(tech);
           totalRowsParsed++;
-          
-          if (totalRowsParsed <= 5) {
-            console.log(`   Row ${i}: ${tech} → ${normalizedPerson} | ${testName}`);
+          if (totalRowsParsed <= 3) {
+            console.log(`   ${tech} → ${normalizedPerson} | ${testName} | ${currentDate}`);
           }
-          
           scheduleData.push({
             date: currentDate,
             person: normalizedPerson,
@@ -187,143 +242,59 @@ function parseExcelAttachment(bytes, state) {
             testId: testId,
             location: site,
             mep: type,
-            state: state
+            state
           });
           rowsInSheet++;
         }
       }
     }
-    console.log(`Sheet ${sheetName}: Added ${rowsInSheet} rows`);
+    console.log(`   Added ${rowsInSheet} rows`);
   }
-  
+
   return scheduleData;
 }
 
-// Decode a single MIME part's body to a Uint8Array
-function decodeAttachmentPart(part) {
-  const headerEndIndex = part.indexOf('\r\n\r\n');
-  if (headerEndIndex === -1) return null;
-  
-  const dataSection = part.substring(headerEndIndex + 4);
-  const base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
-  
-  try {
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    return bytes;
-  } catch (e) {
-    console.error('Failed to decode base64:', e.message);
-    return null;
-  }
-}
-
-// Process one Excel file end-to-end (parse + delete old + upload new + update metadata)
-async function processExcelFile(fileName, bytes, projectId, accessToken) {
-  const state = determineState(fileName);
+async function processScheduleFile(fileName, bytes, state, accessToken) {
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-  console.log(`📂 Processing ${state} file: ${fileName}`);
+  console.log(`📅 Processing SCHEDULE for ${state}: ${fileName}`);
   console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-  
-  const scheduleData = parseExcelAttachment(bytes, state);
-  console.log(`Total entries parsed: ${scheduleData.length}`);
-  
+
+  const scheduleData = parseScheduleExcel(bytes, state);
+  console.log(`Parsed ${scheduleData.length} schedule entries`);
+
   if (scheduleData.length === 0) {
-    console.log(`⚠️  No entries parsed from ${fileName} — skipping`);
-    return { state, fileName, count: 0, status: 'skipped' };
+    return { fileName, kind: 'schedule', state, count: 0, status: 'skipped' };
   }
-  
-  // STEP 1: Get all existing documents for this state
-  console.log(`📋 Fetching existing ${state} documents...`);
-  const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current/rows?pageSize=1000`;
-  
-  const docsToDelete = [];
-  let pageToken = '';
-  
-  do {
-    const url = pageToken ? `${listUrl}&pageToken=${pageToken}` : listUrl;
-    const listResponse = await fetch(url, {
-      method: 'GET',
-      headers: { 'Authorization': `Bearer ${accessToken}` }
-    });
-    
-    const listData = await listResponse.json();
-    
-    if (listData.documents) {
-      for (const doc of listData.documents) {
-        if (doc.name.includes('/schedule/current/rows/') && 
-            doc.fields?.state?.stringValue === state) {
-          docsToDelete.push(doc.name);
-        }
+
+  const docsToDelete = await listCollectionDocs(
+    accessToken,
+    'schedule/current/rows',
+    doc => doc.name.includes('/schedule/current/rows/') && doc.fields?.state?.stringValue === state
+  );
+  console.log(`🗑️  Found ${docsToDelete.length} old ${state} schedule docs to delete`);
+
+  const creates = scheduleData.map((entry, idx) => ({
+    update: {
+      name: `projects/${PROJECT_ID}/databases/(default)/documents/schedule/current/rows/doc_${Date.now()}_${idx}_${Math.floor(Math.random() * 10000)}`,
+      fields: {
+        date: { stringValue: String(entry.date || '') },
+        person: { stringValue: String(entry.person || '') },
+        test: { stringValue: String(entry.test || '') },
+        zipCode: { stringValue: String(entry.zipCode || '') },
+        testId: { stringValue: String(entry.testId || '') },
+        location: { stringValue: String(entry.location || '') },
+        state: { stringValue: String(entry.state || '') },
+        mep: { stringValue: String(entry.mep || '') },
+        time: { stringValue: '' }
       }
     }
-    
-    pageToken = listData.nextPageToken || '';
-  } while (pageToken);
-  
-  console.log(`🗑️  Found ${docsToDelete.length} old ${state} documents to delete`);
-  
-  // STEP 2: Batch deletes + creates
-  const BATCH_SIZE = 500;
-  let totalOperations = 0;
-  let deleteIndex = 0;
-  let createIndex = 0;
-  let batchNumber = 1;
-  
-  while (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
-    const writes = [];
-    
-    while (deleteIndex < docsToDelete.length && writes.length < BATCH_SIZE) {
-      writes.push({ delete: docsToDelete[deleteIndex] });
-      deleteIndex++;
-    }
-    
-    while (createIndex < scheduleData.length && writes.length < BATCH_SIZE) {
-      const entry = scheduleData[createIndex];
-      
-      writes.push({
-        update: {
-          name: `projects/${projectId}/databases/(default)/documents/schedule/current/rows/doc_${Date.now()}_${createIndex}_${Math.floor(Math.random() * 10000)}`,
-          fields: {
-            date: { stringValue: String(entry.date || '') },
-            person: { stringValue: String(entry.person || '') },
-            test: { stringValue: String(entry.test || '') },
-            zipCode: { stringValue: String(entry.zipCode || '') },
-            testId: { stringValue: String(entry.testId || '') },
-            location: { stringValue: String(entry.location || '') },
-            state: { stringValue: String(entry.state || '') },
-            mep: { stringValue: String(entry.mep || '') },
-            time: { stringValue: '' }
-          }
-        }
-      });
-      createIndex++;
-    }
-    
-    if (writes.length > 0) {
-      console.log(`📦 [${state}] Batch ${batchNumber}: ${writes.length} operations...`);
-      await batchWriteFirestore(projectId, accessToken, writes);
-      totalOperations += writes.length;
-      console.log(`✅ [${state}] Batch ${batchNumber} complete (${totalOperations} total)`);
-      batchNumber++;
-      
-      if (deleteIndex < docsToDelete.length || createIndex < scheduleData.length) {
-        await sleep(100);
-      }
-    }
-  }
-  
-  console.log(`✅ ${state}: Deleted ${docsToDelete.length}, Created ${scheduleData.length}`);
-  
-  // STEP 3: Update metadata for this state
-  await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/schedule/current`, {
+  }));
+
+  await runBatchedWrites(accessToken, docsToDelete, creates, `SCHEDULE/${state}`);
+
+  await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current`, {
     method: 'PATCH',
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json'
-    },
+    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
       fields: {
         [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
@@ -332,83 +303,286 @@ async function processExcelFile(fileName, bytes, projectId, accessToken) {
       }
     })
   });
-  
-  console.log(`🎉 ${state} upload complete: ${scheduleData.length} documents`);
-  return { state, fileName, count: scheduleData.length, status: 'success' };
+
+  return { fileName, kind: 'schedule', state, count: scheduleData.length, status: 'success' };
 }
+
+// ─── IOCS parser ────────────────────────────────────────────────────
+
+function normalizeIocsDate(raw) {
+  if (!raw && raw !== 0) return '';
+  const s = String(raw).trim();
+  if (!s) return '';
+
+  const slashMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (slashMatch) {
+    const mm = slashMatch[1].padStart(2, '0');
+    const dd = slashMatch[2].padStart(2, '0');
+    let yy = slashMatch[3];
+    if (yy.length === 2) yy = '20' + yy;
+    return `${yy}-${mm}-${dd}`;
+  }
+
+  const dashMatch = s.match(/^(\d{1,2})-(\d{1,2})-(\d{2,4})$/);
+  if (dashMatch) {
+    const mm = dashMatch[1].padStart(2, '0');
+    const dd = dashMatch[2].padStart(2, '0');
+    let yy = dashMatch[3];
+    if (yy.length === 2) yy = '20' + yy;
+    return `${yy}-${mm}-${dd}`;
+  }
+
+  if (/^\d+(\.\d+)?$/.test(s)) {
+    const serial = parseFloat(s);
+    if (serial > 25000 && serial < 80000) {
+      const utcDays = serial - 25569;
+      const utcValue = utcDays * 86400 * 1000;
+      const d = new Date(utcValue);
+      if (!isNaN(d.getTime())) {
+        return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+      }
+    }
+  }
+
+  try {
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) {
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }
+  } catch {}
+
+  return s;
+}
+
+function detectIocsState(location) {
+  const loc = String(location || '').toUpperCase();
+  if (loc.includes(' UT ') || loc.endsWith(' UT') || loc.includes('UTAH')) return 'Utah';
+  return 'Nevada';
+}
+
+function parseIocsExcel(bytes) {
+  const workbook = XLSX.read(bytes, { type: 'array' });
+  const allEntries = [];
+
+  for (const sheetName of workbook.SheetNames) {
+    if (sheetName === 'BLANK' || sheetName === 'Sheet2') continue;
+
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+
+    let rowsInSheet = 0;
+    for (let i = 2; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row || !row[1]) continue;
+
+      const assignedDct = String(row[11] || '').trim().toUpperCase();
+      if (!assignedDct || assignedDct === 'ASSIGNED DCT') continue;
+      // Skip rows where DCT column has junk (times, "READ TIME CHANGE", etc.)
+      // Real DCT values are uppercase names like "REYNOSO RYAN"
+      if (!/^[A-Z][A-Z\s.\-]*[A-Z]$/.test(assignedDct)) continue;
+      // Must contain at least one space (first + last name)
+      if (!assignedDct.includes(' ') && assignedDct.length < 2) continue;
+
+      // Date validation — must contain digits (filter out "DATE OF EMAIL" etc.)
+      const rawDate = String(row[1] || '').trim();
+      if (!/\d/.test(rawDate)) continue;
+
+      const location = String(row[3] || '').trim();
+      const entry = {
+        weekSheet: sheetName,
+        date: normalizeIocsDate(row[1]),
+        financeCode: String(row[2] || ''),
+        location,
+        ein: String(row[4] || ''),
+        employeeName: String(row[5] || '').trim(),
+        rd: String(row[6] || '').trim(),
+        bt: String(row[7] || ''),
+        et: String(row[8] || ''),
+        rt: String(row[10] || ''),
+        dct: assignedDct,
+        state: detectIocsState(location)
+      };
+
+      if (allEntries.length < 3) {
+        console.log(`[IOCS] Sample: ${entry.dct} | ${entry.employeeName} | ${entry.date} | ${entry.state} | RT ${entry.rt}`);
+      }
+
+      allEntries.push(entry);
+      rowsInSheet++;
+    }
+    if (rowsInSheet > 0) console.log(`[IOCS] Sheet ${sheetName}: ${rowsInSheet} entries`);
+  }
+
+  return allEntries;
+}
+
+async function processIocsFile(fileName, bytes, accessToken) {
+  console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  console.log(`📊 Processing IOCS file: ${fileName}`);
+  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+
+  const iocsEntries = parseIocsExcel(bytes);
+  console.log(`Parsed ${iocsEntries.length} IOCS entries`);
+
+  if (iocsEntries.length === 0) {
+    return { fileName, kind: 'iocs', count: 0, status: 'skipped' };
+  }
+
+  const statesInFile = [...new Set(iocsEntries.map(e => e.state))];
+  console.log(`States represented: ${statesInFile.join(', ')}`);
+
+  const docsToDelete = await listCollectionDocs(
+    accessToken,
+    'iocs',
+    doc => {
+      if (!doc.name.includes('/iocs/')) return false;
+      const state = doc.fields?.state?.stringValue;
+      return statesInFile.includes(state);
+    }
+  );
+  console.log(`🗑️  Found ${docsToDelete.length} old IOCS docs to delete`);
+
+  const creates = iocsEntries.map((entry, idx) => ({
+    update: {
+      name: `projects/${PROJECT_ID}/databases/(default)/documents/iocs/doc_${Date.now()}_${idx}_${Math.floor(Math.random() * 10000)}`,
+      fields: {
+        weekSheet: { stringValue: String(entry.weekSheet || '') },
+        date: { stringValue: String(entry.date || '') },
+        financeCode: { stringValue: String(entry.financeCode || '') },
+        location: { stringValue: String(entry.location || '') },
+        ein: { stringValue: String(entry.ein || '') },
+        employeeName: { stringValue: String(entry.employeeName || '') },
+        rd: { stringValue: String(entry.rd || '') },
+        bt: { stringValue: String(entry.bt || '') },
+        et: { stringValue: String(entry.et || '') },
+        rt: { stringValue: String(entry.rt || '') },
+        dct: { stringValue: String(entry.dct || '') },
+        state: { stringValue: String(entry.state || '') },
+        uploadedAt: { timestampValue: new Date().toISOString() }
+      }
+    }
+  }));
+
+  await runBatchedWrites(accessToken, docsToDelete, creates, 'IOCS');
+
+  await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current`, {
+    method: 'PATCH',
+    headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fields: {
+        iocsUpdatedAt: { timestampValue: new Date().toISOString() },
+        iocsCount: { integerValue: iocsEntries.length.toString() },
+        iocsFilename: { stringValue: fileName }
+      }
+    })
+  });
+
+  return { fileName, kind: 'iocs', count: iocsEntries.length, states: statesInFile, status: 'success' };
+}
+
+// ─── MIME attachment decode ─────────────────────────────────────────
+
+function decodeAttachmentPart(part) {
+  const headerEndIndex = part.indexOf('\r\n\r\n');
+  if (headerEndIndex === -1) return null;
+
+  const dataSection = part.substring(headerEndIndex + 4);
+  const base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
+
+  try {
+    const binaryString = atob(base64Data);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+    return bytes;
+  } catch (e) {
+    console.error('Failed to decode base64:', e.message);
+    return null;
+  }
+}
+
+// ─── Main handler ───────────────────────────────────────────────────
 
 export default {
   async email(message, env, ctx) {
     try {
       const rawEmail = await new Response(message.raw).text();
-      
+
       const contentType = message.headers.get('content-type') || '';
       const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
       if (!boundaryMatch) {
-        console.error('❌ NO MIME BOUNDARY FOUND');
+        console.error('❌ NO MIME BOUNDARY');
         return;
       }
-      
+
       const boundary = boundaryMatch[1];
       const parts = rawEmail.split(`--${boundary}`);
-      
-      // Collect ALL Excel attachments (not just the first one)
+
       const attachments = [];
-      
       for (const part of parts) {
-        if (part.includes('Content-Disposition: attachment') && 
+        if (part.includes('Content-Disposition: attachment') &&
             (part.includes('.xlsx') || part.includes('.xls'))) {
           const fileNameMatch = part.match(/filename="?([^"\r\n]+)"?/);
           if (!fileNameMatch) continue;
           const fileName = fileNameMatch[1];
-          
           attachments.push({ part, fileName });
-          console.log(`✅ Found attachment: ${fileName} (${part.length} bytes)`);
+          console.log(`✅ Attachment: ${fileName} (${part.length} bytes)`);
         }
       }
-      
+
       if (attachments.length === 0) {
-        console.error('❌ NO EXCEL ATTACHMENTS FOUND');
+        console.error('❌ NO EXCEL ATTACHMENTS');
         return;
       }
-      
-      console.log(`\n📬 Email contains ${attachments.length} Excel attachment(s)`);
-      
+
+      console.log(`\n📬 Email has ${attachments.length} attachment(s)`);
+
       const accessToken = await getAccessToken();
-      const projectId = 'work-schedule-1f2e1';
       const results = [];
-      
-      // Process each attachment sequentially
+
       for (const { part, fileName } of attachments) {
         try {
           const bytes = decodeAttachmentPart(part);
           if (!bytes) {
-            console.error(`❌ Failed to decode ${fileName}`);
             results.push({ fileName, status: 'decode_failed' });
             continue;
           }
-          
-          const result = await processExcelFile(fileName, bytes, projectId, accessToken);
+
+          const workbook = XLSX.read(bytes, { type: 'array' });
+          const classification = classifyWorkbook(workbook, fileName);
+
+          console.log(`\n🔍 ${fileName} → ${classification.kind}${classification.state ? ' (' + classification.state + ')' : ''}`);
+
+          let result;
+          if (classification.kind === 'iocs') {
+            result = await processIocsFile(fileName, bytes, accessToken);
+          } else if (classification.kind === 'schedule') {
+            result = await processScheduleFile(fileName, bytes, classification.state, accessToken);
+          } else {
+            result = { fileName, status: 'unknown_type' };
+          }
           results.push(result);
-        } catch (fileError) {
-          console.error(`❌ Error processing ${fileName}:`, fileError.message);
-          console.error('Stack:', fileError.stack);
-          results.push({ fileName, status: 'error', error: fileError.message });
-          // Continue with other files even if one fails
+        } catch (err) {
+          console.error(`❌ Error processing ${fileName}:`, err.message);
+          console.error('Stack:', err.stack);
+          results.push({ fileName, status: 'error', error: err.message });
         }
       }
-      
+
       console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
       console.log(`📊 SUMMARY:`);
       for (const r of results) {
         if (r.status === 'success') {
-          console.log(`   ✅ ${r.state}: ${r.count} entries (${r.fileName})`);
+          if (r.kind === 'iocs') {
+            console.log(`   ✅ IOCS: ${r.count} entries [${(r.states || []).join(', ')}] (${r.fileName})`);
+          } else {
+            console.log(`   ✅ ${r.state} schedule: ${r.count} entries (${r.fileName})`);
+          }
         } else {
           console.log(`   ❌ ${r.fileName}: ${r.status}${r.error ? ' — ' + r.error : ''}`);
         }
       }
       console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
-      
+
     } catch (error) {
       console.error('❌ Top-level error:', error);
       console.error('Stack:', error.stack);
