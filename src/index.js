@@ -9,6 +9,35 @@ const SERVICE_ACCOUNT = {
   token_uri: "https://oauth2.googleapis.com/token"
 };
 
+
+// Normalize tech names to initials for Nevada
+function normalizePersonName(name) {
+  const upper = name.trim().toUpperCase();
+  
+  // Map full names to initials
+  const nameMap = {
+    'JASON': 'JRA',
+    'JASON ALVAREZ': 'JRA',
+    'JERRY': 'JA', 
+    'JERRY ANGLO': 'JA',
+    'JEFF': 'JN',
+    'JEFF NIZNICK': 'JN',
+    'GRACE': 'GA',
+    'GRACE AGRESOR': 'GA',
+    'SHEILA': 'SV',
+    'SHEILA VELASQUEZ': 'SV',
+    'RYAN': 'RR',
+    'RYAN REYNOSO': 'RR',
+    'CHRISTIAN': 'CA',
+    'CHRISTIAN ALBERT': 'CA',
+    'KRISTINE': 'KK',
+    'KRISTINE KIESLING': 'KK',
+    'BUDD': 'KK'
+  };
+  
+  return nameMap[upper] || name;
+}
+
 async function getAccessToken() {
   const jwtHeader = btoa(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
   const now = Math.floor(Date.now() / 1000);
@@ -176,9 +205,10 @@ export default {
             const tech = String(row[5] || '').trim();
             
             if (tech && tech !== 'TECH(S)' && rt !== 'ZIP CODES') {
+              const normalizedPerson = normalizePersonName(tech);
               scheduleData.push({
                 date: currentDate,
-                person: tech,
+                person: normalizedPerson,
                 test: rt,
                 zipCode: zip,
                 testId: iocs,
