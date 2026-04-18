@@ -197,23 +197,23 @@ export default {
           }
           
           if (currentDate && row.length >= 6) {
-            const rt = String(row[0] || '').trim();
+            const testName = String(row[0] || '').trim();
             const zip = String(row[1] || '').trim();
             const site = String(row[2] || '').trim();
-            const test = String(row[3] || '').trim();
-            const iocs = String(row[4] || '').trim();
+            const type = String(row[3] || '').trim();
+            const testId = String(row[4] || '').trim();
             const tech = String(row[5] || '').trim();
             
-            if (tech && tech !== 'TECH(S)' && rt !== 'ZIP CODES') {
+            if (tech && tech !== 'TECH(S)' && testName && testName !== 'ZIP CODES') {
               const normalizedPerson = normalizePersonName(tech);
               scheduleData.push({
                 date: currentDate,
                 person: normalizedPerson,
-                test: rt,
+                test: testName,
                 zipCode: zip,
-                testId: iocs,
+                testId: testId,
                 location: site,
-                mep: test,
+                mep: type,
                 state: state
               });
               rowsInSheet++;
