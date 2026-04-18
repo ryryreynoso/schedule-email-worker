@@ -287,16 +287,16 @@ export default {
           
           writes.push({
             update: {
-              name: `projects/${projectId}/databases/(default)/documents/schedule/current/rows/${Date.now()}_${createIndex}`,
+              name: `projects/${projectId}/databases/(default)/documents/schedule/current/rows/doc_${Date.now()}_${createIndex}_${Math.floor(Math.random() * 10000)}`,
               fields: {
-                date: { stringValue: entry.date },
-                person: { stringValue: entry.person },
-                test: { stringValue: entry.test },
-                zipCode: { stringValue: entry.zipCode },
-                testId: { stringValue: entry.testId },
-                location: { stringValue: entry.location },
-                state: { stringValue: entry.state },
-                mep: { stringValue: entry.mep || '' },
+                date: { stringValue: String(entry.date || '') },
+                person: { stringValue: String(entry.person || '') },
+                test: { stringValue: String(entry.test || '') },
+                zipCode: { stringValue: String(entry.zipCode || '') },
+                testId: { stringValue: String(entry.testId || '') },
+                location: { stringValue: String(entry.location || '') },
+                state: { stringValue: String(entry.state || '') },
+                mep: { stringValue: String(entry.mep || '') },
                 time: { stringValue: '' }
               }
             }
