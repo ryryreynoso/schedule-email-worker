@@ -35,7 +35,7 @@ function normalizePersonName(name) {
     'BUDD': 'KK'
   };
   
-  return nameMap[upper] || name;
+  return nameMap[upper] || upper;
 }
 
 async function getAccessToken() {
