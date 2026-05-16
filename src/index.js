@@ -130,11 +130,11 @@ async function runBatchedWrites(accessToken, deletes, creates, label) {
 
   while (delIdx < deletes.length || createIdx < creates.length) {
     const writes = [];
-    while (delIdx < deletes.length && writes.length < BATCH_SIZE) {
-      writes.push({ delete: deletes[delIdx++] });
-    }
     while (createIdx < creates.length && writes.length < BATCH_SIZE) {
       writes.push(creates[createIdx++]);
+    }
+    while (delIdx < deletes.length && writes.length < BATCH_SIZE) {
+      writes.push({ delete: deletes[delIdx++] });
     }
     if (writes.length === 0) break;
 
@@ -148,6 +148,25 @@ async function runBatchedWrites(accessToken, deletes, creates, label) {
 }
 
 // ─── File type detection ────────────────────────────────────────────
+
+function normalizeFileName(fileName) {
+  return String(fileName || '')
+    .toLowerCase()
+    .replace(/%20/g, ' ')
+    .replace(/[_\-.()[\]]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function detectStateFromFileName(fileName) {
+  const normalized = normalizeFileName(fileName);
+  const tokens = normalized.split(' ').filter(Boolean);
+
+  if (tokens.includes('utah') || tokens.includes('ut')) return 'Utah';
+  if (tokens.includes('nevada') || tokens.includes('nv')) return 'Nevada';
+
+  return null;
+}
 
 function classifyWorkbook(workbook, fileName) {
   const fn = fileName.toLowerCase();
@@ -177,13 +196,11 @@ function classifyWorkbook(workbook, fileName) {
   if (looksLikeIocs) return { kind: 'iocs' };
 
   // Schedule file — determine state
-  if (fn.includes('utah') || /\but\b/.test(fn) || fn.startsWith('ut')) {
-    return { kind: 'schedule', state: 'Utah' };
+  const detectedState = detectStateFromFileName(fileName);
+  if (!detectedState) {
+    throw new Error(`Could not detect schedule state from filename "${fileName}". Include UT/Utah or NV/Nevada in the filename.`);
   }
-  if (fn.includes('nevada') || /\bnv\b/.test(fn) || fn.startsWith('nv')) {
-    return { kind: 'schedule', state: 'Nevada' };
-  }
-  return { kind: 'schedule', state: 'Nevada' };
+  return { kind: 'schedule', state: detectedState };
 }
 
 // ─── Schedule parser ────────────────────────────────────────────────
@@ -582,11 +599,12 @@ async function processIocsFile(fileName, bytes, accessToken) {
 // ─── MIME attachment decode ─────────────────────────────────────────
 
 function decodeAttachmentPart(part) {
-  const headerEndIndex = part.indexOf('\r\n\r\n');
+  const headerEndIndex = part.search(/\r?\n\r?\n/);
   if (headerEndIndex === -1) return null;
 
-  const dataSection = part.substring(headerEndIndex + 4);
-  const base64Data = dataSection.split('--')[0].replace(/\r\n/g, '').replace(/\s/g, '');
+  const separator = part.match(/\r?\n\r?\n/)[0];
+  const dataSection = part.substring(headerEndIndex + separator.length);
+  const base64Data = dataSection.replace(/\s/g, '');
 
   try {
     const binaryString = atob(base64Data);
@@ -597,6 +615,36 @@ function decodeAttachmentPart(part) {
     console.error('Failed to decode base64:', e.message);
     return null;
   }
+}
+
+function decodeMimeHeaderValue(value) {
+  return String(value || '').replace(/=\?([^?]+)\?([BQbq])\?([^?]+)\?=/g, (_match, charset, encoding, encoded) => {
+    if (!/^utf-?8$/i.test(charset)) return encoded;
+    try {
+      if (encoding.toUpperCase() === 'B') {
+        const binary = atob(encoded);
+        return new TextDecoder('utf-8').decode(Uint8Array.from(binary, c => c.charCodeAt(0)));
+      }
+      return decodeURIComponent(encoded.replace(/_/g, ' ').replace(/=([0-9A-F]{2})/gi, '%$1'));
+    } catch {
+      return encoded;
+    }
+  });
+}
+
+function extractAttachmentFileName(part) {
+  const unfolded = part.replace(/\r?\n[ \t]+/g, ' ');
+  const filenameStar = unfolded.match(/filename\*\s*=\s*(?:UTF-8''|utf-8'')?([^;\r\n]+)/i);
+  if (filenameStar) {
+    try {
+      return decodeURIComponent(filenameStar[1].trim().replace(/^"|"$/g, ''));
+    } catch {
+      return filenameStar[1].trim().replace(/^"|"$/g, '');
+    }
+  }
+
+  const filename = unfolded.match(/filename\s*=\s*"([^"]+)"/i) || unfolded.match(/filename\s*=\s*([^;\r\n]+)/i);
+  return filename ? decodeMimeHeaderValue(filename[1].trim().replace(/^"|"$/g, '')) : '';
 }
 
 // ─── Main handler ───────────────────────────────────────────────────
@@ -620,11 +668,9 @@ export default {
 
       const attachments = [];
       for (const part of parts) {
-        if (part.includes('Content-Disposition: attachment') &&
-            (part.includes('.xlsx') || part.includes('.xls'))) {
-          const fileNameMatch = part.match(/filename="?([^"\r\n]+)"?/);
-          if (!fileNameMatch) continue;
-          const fileName = fileNameMatch[1];
+        const fileName = extractAttachmentFileName(part);
+        if (/content-disposition:\s*attachment/i.test(part) &&
+            /\.(xlsx|xls)$/i.test(fileName)) {
           attachments.push({ part, fileName });
           console.log(`✅ Attachment: ${fileName} (${part.length} bytes)`);
         }
