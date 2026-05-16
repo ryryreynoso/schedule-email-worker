@@ -647,6 +647,29 @@ function extractAttachmentFileName(part) {
   return filename ? decodeMimeHeaderValue(filename[1].trim().replace(/^"|"$/g, '')) : '';
 }
 
+function getHeaderFromRawEmail(rawEmail, headerName) {
+  const lines = String(rawEmail || '').split(/\r?\n/);
+  const headerLines = [];
+
+  for (const line of lines) {
+    if (line === '') break;
+    if (/^[ \t]/.test(line) && headerLines.length > 0) {
+      headerLines[headerLines.length - 1] += ` ${line.trim()}`;
+    } else {
+      headerLines.push(line);
+    }
+  }
+
+  const prefix = `${headerName.toLowerCase()}:`;
+  const match = headerLines.find(line => line.toLowerCase().startsWith(prefix));
+  return match ? match.slice(match.indexOf(':') + 1).trim() : '';
+}
+
+function getMimeBoundary(contentType) {
+  const match = String(contentType || '').match(/boundary=(?:"([^"]+)"|'([^']+)'|([^;\s]+))/i);
+  return match ? (match[1] || match[2] || match[3] || '').trim() : '';
+}
+
 // ─── Main handler ───────────────────────────────────────────────────
 
 export default {
@@ -656,14 +679,18 @@ export default {
 
       const rawEmail = await new Response(message.raw).text();
 
-      const contentType = message.headers.get('content-type') || '';
-      const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/);
-      if (!boundaryMatch) {
+      const headerContentType = message.headers.get('content-type') || message.headers.get('Content-Type') || '';
+      const rawContentType = getHeaderFromRawEmail(rawEmail, 'content-type');
+      const contentType = headerContentType || rawContentType;
+      const boundary = getMimeBoundary(contentType);
+
+      if (!boundary) {
         console.error('❌ NO MIME BOUNDARY');
+        console.error(`Header content-type: ${headerContentType || '(empty)'}`);
+        console.error(`Raw content-type: ${rawContentType || '(empty)'}`);
         return;
       }
 
-      const boundary = boundaryMatch[1];
       const parts = rawEmail.split(`--${boundary}`);
 
       const attachments = [];
