@@ -732,6 +732,13 @@ export default {
       }
       console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
+      try {
+        await message.forward('ryryreynoso@gmail.com');
+        console.log('📨 Forwarded processed email to ryryreynoso@gmail.com');
+      } catch (forwardError) {
+        console.error('⚠️ Upload processing finished, but forwarding failed:', forwardError.message);
+      }
+
     } catch (error) {
       console.error('❌ Top-level error:', error);
       console.error('Stack:', error.stack);
