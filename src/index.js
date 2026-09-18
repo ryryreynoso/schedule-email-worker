@@ -147,6 +147,36 @@ async function runBatchedWrites(accessToken, deletes, creates, label) {
   console.log(`✅ [${label}] ${deletes.length} deleted, ${creates.length} created (${total} total ops)`);
 }
 
+async function writeWorkerLog(accessToken, event) {
+  if (!accessToken) return;
+
+  const docId = `mail_${Date.now()}_${Math.floor(Math.random() * 100000)}`;
+  const fields = {
+    createdAt: { timestampValue: new Date().toISOString() },
+    status: { stringValue: String(event.status || '') },
+    subject: { stringValue: String(event.subject || '') },
+    from: { stringValue: String(event.from || '') },
+    attachmentCount: { integerValue: String(event.attachmentCount || 0) },
+    attachmentNames: { arrayValue: { values: (event.attachmentNames || []).map(name => ({ stringValue: String(name) })) } },
+    message: { stringValue: String(event.message || '') }
+  };
+
+  if (event.results) {
+    fields.resultsJson = { stringValue: JSON.stringify(event.results).slice(0, 5000) };
+  }
+
+  try {
+    await batchWriteFirestore(accessToken, [{
+      update: {
+        name: `projects/${PROJECT_ID}/databases/(default)/documents/scheduleEmailLogs/${docId}`,
+        fields
+      }
+    }]);
+  } catch (err) {
+    console.error('⚠️ Failed to write worker diagnostic log:', err.message);
+  }
+}
+
 // ─── File type detection ────────────────────────────────────────────
 
 function normalizeFileName(fileName) {
@@ -598,21 +628,44 @@ async function processIocsFile(fileName, bytes, accessToken) {
 
 // ─── MIME attachment decode ─────────────────────────────────────────
 
+function getPartHeader(part, headerName) {
+  const headerEndIndex = part.search(/\r?\n\r?\n/);
+  const headerText = headerEndIndex === -1 ? part : part.slice(0, headerEndIndex);
+  const unfolded = headerText.replace(/\r?\n[ \t]+/g, ' ');
+  const prefix = `${headerName.toLowerCase()}:`;
+  const line = unfolded.split(/\r?\n/).find(l => l.toLowerCase().startsWith(prefix));
+  return line ? line.slice(line.indexOf(':') + 1).trim() : '';
+}
+
+function decodeQuotedPrintable(value) {
+  const normalized = String(value || '')
+    .replace(/=\r?\n/g, '')
+    .replace(/=([0-9A-F]{2})/gi, (_m, hex) => String.fromCharCode(parseInt(hex, 16)));
+  return new TextEncoder().encode(normalized);
+}
+
 function decodeAttachmentPart(part) {
   const headerEndIndex = part.search(/\r?\n\r?\n/);
   if (headerEndIndex === -1) return null;
 
   const separator = part.match(/\r?\n\r?\n/)[0];
   const dataSection = part.substring(headerEndIndex + separator.length);
-  const base64Data = dataSection.replace(/\s/g, '');
+  const transferEncoding = getPartHeader(part, 'content-transfer-encoding').toLowerCase();
 
   try {
-    const binaryString = atob(base64Data);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
-    return bytes;
+    if (!transferEncoding || transferEncoding.includes('base64')) {
+      const base64Data = dataSection.replace(/\s/g, '');
+      const binaryString = atob(base64Data);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) bytes[i] = binaryString.charCodeAt(i);
+      return bytes;
+    }
+    if (transferEncoding.includes('quoted-printable')) {
+      return decodeQuotedPrintable(dataSection);
+    }
+    return new TextEncoder().encode(dataSection);
   } catch (e) {
-    console.error('Failed to decode base64:', e.message);
+    console.error(`Failed to decode attachment (${transferEncoding || 'base64'}):`, e.message);
     return null;
   }
 }
@@ -644,7 +697,19 @@ function extractAttachmentFileName(part) {
   }
 
   const filename = unfolded.match(/filename\s*=\s*"([^"]+)"/i) || unfolded.match(/filename\s*=\s*([^;\r\n]+)/i);
-  return filename ? decodeMimeHeaderValue(filename[1].trim().replace(/^"|"$/g, '')) : '';
+  if (filename) return decodeMimeHeaderValue(filename[1].trim().replace(/^"|"$/g, ''));
+
+  const nameStar = unfolded.match(/name\*\s*=\s*(?:UTF-8''|utf-8'')?([^;\r\n]+)/i);
+  if (nameStar) {
+    try {
+      return decodeURIComponent(nameStar[1].trim().replace(/^"|"$/g, ''));
+    } catch {
+      return nameStar[1].trim().replace(/^"|"$/g, '');
+    }
+  }
+
+  const name = unfolded.match(/\bname\s*=\s*"([^"]+)"/i) || unfolded.match(/\bname\s*=\s*([^;\r\n]+)/i);
+  return name ? decodeMimeHeaderValue(name[1].trim().replace(/^"|"$/g, '')) : '';
 }
 
 function getHeaderFromRawEmail(rawEmail, headerName) {
@@ -670,14 +735,51 @@ function getMimeBoundary(contentType) {
   return match ? (match[1] || match[2] || match[3] || '').trim() : '';
 }
 
+function extractExcelAttachments(rawEmail, boundary) {
+  const candidates = [];
+  const seen = new Set();
+  const topLevelParts = boundary ? rawEmail.split(`--${boundary}`) : [];
+  const anyBoundaryParts = rawEmail.split(/\r?\n--[^\r\n]+(?:--)?\r?\n/g);
+
+  for (const part of [...topLevelParts, ...anyBoundaryParts]) {
+    const fileName = extractAttachmentFileName(part);
+    if (!/\.(xlsx|xls)$/i.test(fileName)) continue;
+
+    const contentType = getPartHeader(part, 'content-type').toLowerCase();
+    const disposition = getPartHeader(part, 'content-disposition').toLowerCase();
+    const transferEncoding = getPartHeader(part, 'content-transfer-encoding').toLowerCase();
+    const isSpreadsheet =
+      contentType.includes('spreadsheet') ||
+      contentType.includes('excel') ||
+      contentType.includes('octet-stream') ||
+      /\.(xlsx|xls)$/i.test(fileName);
+
+    if (!isSpreadsheet) continue;
+
+    const key = `${fileName}:${part.length}:${transferEncoding}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({ part, fileName, disposition: disposition || '(none)' });
+  }
+
+  return candidates;
+}
+
 // ─── Main handler ───────────────────────────────────────────────────
 
 export default {
   async email(message, env, ctx) {
+    let accessToken = '';
+    let subject = '';
+    let from = '';
     try {
       const serviceAccount = loadServiceAccount(env);
+      accessToken = await getAccessToken(serviceAccount);
+      console.log('✅ Got access token');
 
       const rawEmail = await new Response(message.raw).text();
+      subject = decodeMimeHeaderValue(message.headers.get('subject') || getHeaderFromRawEmail(rawEmail, 'subject') || '');
+      from = decodeMimeHeaderValue(message.headers.get('from') || getHeaderFromRawEmail(rawEmail, 'from') || '');
 
       const headerContentType = message.headers.get('content-type') || message.headers.get('Content-Type') || '';
       const rawContentType = getHeaderFromRawEmail(rawEmail, 'content-type');
@@ -688,30 +790,32 @@ export default {
         console.error('❌ NO MIME BOUNDARY');
         console.error(`Header content-type: ${headerContentType || '(empty)'}`);
         console.error(`Raw content-type: ${rawContentType || '(empty)'}`);
+        await writeWorkerLog(accessToken, {
+          status: 'no_boundary',
+          subject,
+          from,
+          message: `Header content-type: ${headerContentType || '(empty)'} | Raw content-type: ${rawContentType || '(empty)'}`
+        });
         return;
       }
 
-      const parts = rawEmail.split(`--${boundary}`);
-
-      const attachments = [];
-      for (const part of parts) {
-        const fileName = extractAttachmentFileName(part);
-        if (/content-disposition:\s*attachment/i.test(part) &&
-            /\.(xlsx|xls)$/i.test(fileName)) {
-          attachments.push({ part, fileName });
-          console.log(`✅ Attachment: ${fileName} (${part.length} bytes)`);
-        }
+      const attachments = extractExcelAttachments(rawEmail, boundary);
+      for (const attachment of attachments) {
+        console.log(`✅ Attachment: ${attachment.fileName} (${attachment.part.length} bytes, disposition: ${attachment.disposition})`);
       }
 
       if (attachments.length === 0) {
         console.error('❌ NO EXCEL ATTACHMENTS');
+        await writeWorkerLog(accessToken, {
+          status: 'no_excel_attachments',
+          subject,
+          from,
+          message: `Boundary ${boundary}; raw length ${rawEmail.length}`
+        });
         return;
       }
 
       console.log(`\n📬 Email has ${attachments.length} attachment(s)`);
-
-      const accessToken = await getAccessToken(serviceAccount);
-      console.log('✅ Got access token');
 
       const results = [];
 
@@ -759,6 +863,15 @@ export default {
       }
       console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
 
+      await writeWorkerLog(accessToken, {
+        status: results.some(r => r.status === 'success') ? 'processed' : 'failed',
+        subject,
+        from,
+        attachmentCount: attachments.length,
+        attachmentNames: attachments.map(a => a.fileName),
+        results
+      });
+
       try {
         await message.forward('ryryreynoso@gmail.com');
         console.log('📨 Forwarded processed email to ryryreynoso@gmail.com');
@@ -769,6 +882,12 @@ export default {
     } catch (error) {
       console.error('❌ Top-level error:', error);
       console.error('Stack:', error.stack);
+      await writeWorkerLog(accessToken, {
+        status: 'top_level_error',
+        subject,
+        from,
+        message: error.message
+      });
     }
   }
 };
