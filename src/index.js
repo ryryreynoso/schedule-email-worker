@@ -355,17 +355,21 @@ async function processScheduleFile(fileName, bytes, state, accessToken) {
 
   await runBatchedWrites(accessToken, docsToDelete, creates, `SCHEDULE/${state}`);
 
-  await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current`, {
+  const scheduleMetaFields = {
+    [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
+    [`${state.toLowerCase()}Count`]: { integerValue: scheduleData.length.toString() },
+    [`${state.toLowerCase()}Filename`]: { stringValue: fileName }
+  };
+  const scheduleUpdateMask = new URLSearchParams();
+  Object.keys(scheduleMetaFields).forEach(field => scheduleUpdateMask.append('updateMask.fieldPaths', field));
+  const scheduleMetaResponse = await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current?${scheduleUpdateMask}`, {
     method: 'PATCH',
     headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      fields: {
-        [`${state.toLowerCase()}UpdatedAt`]: { timestampValue: new Date().toISOString() },
-        [`${state.toLowerCase()}Count`]: { integerValue: scheduleData.length.toString() },
-        [`${state.toLowerCase()}Filename`]: { stringValue: fileName }
-      }
-    })
+    body: JSON.stringify({ fields: scheduleMetaFields })
   });
+  if (!scheduleMetaResponse.ok) {
+    throw new Error(`Schedule metadata update failed: ${scheduleMetaResponse.status} ${await scheduleMetaResponse.text()}`);
+  }
 
   return { fileName, kind: 'schedule', state, count: scheduleData.length, status: 'success' };
 }
@@ -666,11 +670,16 @@ async function processIocsFile(fileName, bytes, accessToken) {
     metaFields[`${stateKey}IocsFilename`] = { stringValue: fileName };
   }
 
-  await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current`, {
+  const iocsUpdateMask = new URLSearchParams();
+  Object.keys(metaFields).forEach(field => iocsUpdateMask.append('updateMask.fieldPaths', field));
+  const iocsMetaResponse = await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current?${iocsUpdateMask}`, {
     method: 'PATCH',
     headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ fields: metaFields })
   });
+  if (!iocsMetaResponse.ok) {
+    throw new Error(`IOCS metadata update failed: ${iocsMetaResponse.status} ${await iocsMetaResponse.text()}`);
+  }
 
   return { fileName, kind: 'iocs', count: iocsEntries.length, states: statesInFile, status: 'success' };
 }
