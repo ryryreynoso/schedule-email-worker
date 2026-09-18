@@ -2,6 +2,9 @@
   "name": "schedule-email-worker",
   "version": "1.0.0",
   "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "xlsx": "^0.18.5"
   }

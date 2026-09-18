@@ -422,7 +422,7 @@ function normalizeIocsDate(raw) {
 }
 
 function formatTime(t) {
-  if (!t) return '';
+  if (t === null || t === undefined || t === '') return '';
   // If it's already HH:MM format, return as-is
   if (typeof t === 'string' && t.match(/^\d{1,2}:\d{2}/)) return t;
   
@@ -449,25 +449,44 @@ function normalizeHeader(value) {
     .trim();
 }
 
+function findHeaderColumn(headers, exactAliases, containsAliases = []) {
+  for (const alias of exactAliases.map(normalizeHeader)) {
+    const index = headers.indexOf(alias);
+    if (index >= 0) return index;
+  }
+
+  for (const alias of containsAliases.map(normalizeHeader)) {
+    if (alias.length < 4) continue;
+    const index = headers.findIndex(header => header.includes(alias));
+    if (index >= 0) return index;
+  }
+
+  return -1;
+}
+
 function findIocsHeader(rows) {
   const maxRowsToScan = Math.min(rows.length, 25);
 
   for (let rowIndex = 0; rowIndex < maxRowsToScan; rowIndex++) {
     const row = rows[rowIndex] || [];
     const headers = row.map(normalizeHeader);
-    const indexOf = (...needles) => headers.findIndex(header => needles.some(needle => header === needle || header.includes(needle)));
 
+    const utahDateColumn = findHeaderColumn(headers, ['TEST DAY']);
     const utah = {
-      dct: indexOf('TECH', 'DCT'),
-      date: indexOf('TEST DAY'),
-      finance: indexOf('FINANCE NO', 'FINANCE NUMBER', 'FINANCE'),
-      office: indexOf('OFFICE'),
-      ein: indexOf('TEST ID', 'EIN'),
-      employee: indexOf('EMPLOYEE'),
-      rd: indexOf('ROSTER DES', 'ROSTER'),
-      bt: indexOf('EMP START TIME', 'START TIME', 'BT'),
-      et: indexOf('EMP END TIME', 'END TIME', 'ET'),
-      rt: indexOf('READ TIME', 'RT')
+      dct: findHeaderColumn(headers, ['TECH', 'DCT', 'ASSIGNED DCT']),
+      // Some weekly masters mislabel column B as DCT. Column C remains the
+      // weekday name, so use B as the date only for that known Utah layout.
+      date: utahDateColumn >= 0
+        ? utahDateColumn
+        : (headers[0] === 'TECH' && headers[1] === 'DCT' && headers[2] === 'DAY' ? 1 : -1),
+      finance: findHeaderColumn(headers, ['FINANCE NO', 'FINANCE NUMBER', 'FINANCE']),
+      office: findHeaderColumn(headers, ['OFFICE', 'LOCATION']),
+      ein: findHeaderColumn(headers, ['TEST ID', 'EIN']),
+      employee: findHeaderColumn(headers, ['EMPLOYEE', 'EMPLOYEE NAME']),
+      rd: findHeaderColumn(headers, ['ROSTER DES', 'ROSTER DESIGNATION', 'ROSTER']),
+      bt: findHeaderColumn(headers, ['EMP START TIME', 'START TIME', 'BT']),
+      et: findHeaderColumn(headers, ['EMP END TIME', 'END TIME', 'ET']),
+      rt: findHeaderColumn(headers, ['READ TIME', 'RT'])
     };
 
     if (utah.date >= 0 && utah.employee >= 0 && utah.dct >= 0) {
@@ -475,16 +494,16 @@ function findIocsHeader(rows) {
     }
 
     const nevada = {
-      date: indexOf('TEST DATE', 'DATE'),
-      finance: indexOf('FINANCE'),
-      office: indexOf('OFFICE', 'LOCATION'),
-      ein: indexOf('EIN', 'TEST ID'),
-      employee: indexOf('EMPLOYEE'),
-      rd: indexOf('ROSTER DES', 'ROSTER'),
-      bt: indexOf('BT', 'BEGIN TIME', 'START TIME'),
-      et: indexOf('ET', 'END TIME'),
-      rt: indexOf('RT', 'READ TIME'),
-      dct: indexOf('ASSIGNED DCT', 'DCT')
+      date: findHeaderColumn(headers, ['TEST DATE', 'DATE']),
+      finance: findHeaderColumn(headers, ['FINANCE', 'FINANCE NO', 'FINANCE NUMBER']),
+      office: findHeaderColumn(headers, ['OFFICE', 'LOCATION']),
+      ein: findHeaderColumn(headers, ['EIN', 'TEST ID']),
+      employee: findHeaderColumn(headers, ['EMPLOYEE', 'EMPLOYEE NAME']),
+      rd: findHeaderColumn(headers, ['ROSTER DES', 'ROSTER DESIGNATION', 'ROSTER']),
+      bt: findHeaderColumn(headers, ['BT', 'BEGIN TIME', 'START TIME']),
+      et: findHeaderColumn(headers, ['ET', 'END TIME']),
+      rt: findHeaderColumn(headers, ['RT', 'READ TIME']),
+      dct: findHeaderColumn(headers, ['ASSIGNED DCT', 'DCT'])
     };
 
     if (nevada.dct >= 0 && nevada.date >= 0 && nevada.employee >= 0) {
@@ -503,7 +522,7 @@ function sheetLooksBlank(sheetName) {
   return /^(BLANK|Sheet2|Sheet3)$/i.test(String(sheetName || '').trim());
 }
 
-function parseIocsExcel(bytes) {
+export function parseIocsExcel(bytes) {
   const workbook = XLSX.read(bytes, { type: 'array' });
   const allEntries = [];
 
@@ -511,8 +530,9 @@ function parseIocsExcel(bytes) {
     if (sheetLooksBlank(sheetName)) continue;
 
     const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
-    const headerInfo = findIocsHeader(rows);
+    const displayRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+    const headerInfo = findIocsHeader(displayRows);
 
     if (!headerInfo) {
       console.log(`[IOCS] Sheet ${sheetName}: no IOCS header found`);
@@ -524,8 +544,10 @@ function parseIocsExcel(bytes) {
     console.log(`[IOCS] Sheet ${sheetName}: detected ${format} header at row ${rowIndex + 1}`);
 
     if (format === 'Utah') {
-      for (let i = rowIndex + 1; i < rows.length; i++) {
-        const row = rows[i];
+      // Utah workbooks format the date cells as weekday names. Read the raw
+      // serial values so entries retain their actual calendar dates.
+      for (let i = rowIndex + 1; i < rawRows.length; i++) {
+        const row = rawRows[i];
         if (!row || row.length === 0) continue;
         
         const techName = String(getCell(row, columns.dct) || '').trim().toUpperCase();
@@ -565,8 +587,8 @@ function parseIocsExcel(bytes) {
       }
       
     } else {
-      for (let i = rowIndex + 1; i < rows.length; i++) {
-        const row = rows[i];
+      for (let i = rowIndex + 1; i < displayRows.length; i++) {
+        const row = displayRows[i];
         if (!row || row.length === 0) continue;
 
         const assignedDct = String(getCell(row, columns.dct) || '').trim().toUpperCase();
