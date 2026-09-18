@@ -206,15 +206,16 @@ function classifyWorkbook(workbook, fileName) {
     return { kind: 'iocs' };
   }
 
-  // Content-based IOCS detection: sheets with "ASSIGNED DCT" or "TEST DAY" header
+  // Content-based IOCS detection: sheets with "ASSIGNED DCT" or "TEST DAY" header.
+  // Some master workbooks have title/instruction rows before the actual header.
   const sheetNames = workbook.SheetNames;
   let looksLikeIocs = false;
   for (const sheetName of sheetNames) {
-    if (sheetName === 'BLANK' || sheetName === 'Sheet2') continue;
+    if (sheetLooksBlank(sheetName)) continue;
     const sheet = workbook.Sheets[sheetName];
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
     if (rows.length < 2) continue;
-    for (let i = 0; i < Math.min(3, rows.length); i++) {
+    for (let i = 0; i < Math.min(25, rows.length); i++) {
       const rowStr = (rows[i] || []).map(c => String(c || '').toUpperCase()).join('|');
       if (rowStr.includes('ASSIGNED DCT') || rowStr.includes('TEST DAY') || rowStr.includes('IOCS READINGS')) {
         looksLikeIocs = true;
@@ -437,62 +438,104 @@ function formatTime(t) {
   return String(t);
 }
 
-function detectIocsFormat(workbook) {
-  // Check first sheet's headers
-  const firstSheet = workbook.Sheets[workbook.SheetNames[0]];
-  const headerRow = XLSX.utils.sheet_to_json(firstSheet, { header: 1, defval: '', raw: false })[0] || [];
-  
-  console.log('[IOCS] Header row:', headerRow);
-  
-  // Utah format has "Test Day" column, Nevada doesn't
-  const hasTestDay = headerRow.some(h => {
-    const hStr = String(h || '');
-    return hStr === 'Test Day' || hStr.toUpperCase().includes('TEST DAY');
-  });
-  
-  console.log('[IOCS] Has Test Day column:', hasTestDay);
-  
-  return hasTestDay ? 'Utah' : 'Nevada';
+function normalizeHeader(value) {
+  return String(value || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ')
+    .trim();
+}
+
+function findIocsHeader(rows) {
+  const maxRowsToScan = Math.min(rows.length, 25);
+
+  for (let rowIndex = 0; rowIndex < maxRowsToScan; rowIndex++) {
+    const row = rows[rowIndex] || [];
+    const headers = row.map(normalizeHeader);
+    const indexOf = (...needles) => headers.findIndex(header => needles.some(needle => header === needle || header.includes(needle)));
+
+    const utah = {
+      dct: indexOf('TECH', 'DCT'),
+      date: indexOf('TEST DAY'),
+      finance: indexOf('FINANCE NO', 'FINANCE NUMBER', 'FINANCE'),
+      office: indexOf('OFFICE'),
+      ein: indexOf('TEST ID', 'EIN'),
+      employee: indexOf('EMPLOYEE'),
+      rd: indexOf('ROSTER DES', 'ROSTER'),
+      bt: indexOf('EMP START TIME', 'START TIME', 'BT'),
+      et: indexOf('EMP END TIME', 'END TIME', 'ET'),
+      rt: indexOf('READ TIME', 'RT')
+    };
+
+    if (utah.date >= 0 && utah.employee >= 0 && utah.dct >= 0) {
+      return { format: 'Utah', rowIndex, columns: utah, headers: row };
+    }
+
+    const nevada = {
+      date: indexOf('TEST DATE', 'DATE'),
+      finance: indexOf('FINANCE'),
+      office: indexOf('OFFICE', 'LOCATION'),
+      ein: indexOf('EIN', 'TEST ID'),
+      employee: indexOf('EMPLOYEE'),
+      rd: indexOf('ROSTER DES', 'ROSTER'),
+      bt: indexOf('BT', 'BEGIN TIME', 'START TIME'),
+      et: indexOf('ET', 'END TIME'),
+      rt: indexOf('RT', 'READ TIME'),
+      dct: indexOf('ASSIGNED DCT', 'DCT')
+    };
+
+    if (nevada.dct >= 0 && nevada.date >= 0 && nevada.employee >= 0) {
+      return { format: 'Nevada', rowIndex, columns: nevada, headers: row };
+    }
+  }
+
+  return null;
+}
+
+function getCell(row, index) {
+  return index >= 0 ? row[index] : '';
+}
+
+function sheetLooksBlank(sheetName) {
+  return /^(BLANK|Sheet2|Sheet3)$/i.test(String(sheetName || '').trim());
 }
 
 function parseIocsExcel(bytes) {
   const workbook = XLSX.read(bytes, { type: 'array' });
-  const iocsFormat = detectIocsFormat(workbook);
-  
-  console.log(`[IOCS] Detected format: ${iocsFormat}`);
-  
   const allEntries = [];
 
   for (const sheetName of workbook.SheetNames) {
-    if (sheetName === 'BLANK' || sheetName === 'Sheet2' || sheetName === 'Sheet3') continue;
+    if (sheetLooksBlank(sheetName)) continue;
 
     const sheet = workbook.Sheets[sheetName];
     const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    const headerInfo = findIocsHeader(rows);
+
+    if (!headerInfo) {
+      console.log(`[IOCS] Sheet ${sheetName}: no IOCS header found`);
+      continue;
+    }
 
     let rowsInSheet = 0;
-    
-    if (iocsFormat === 'Utah') {
-      // UTAH FORMAT
-      // Columns: Tech(0), Test Day(1), Day(2), Finance No.(3), Office Zip(4), Office(5), 
-      //          Pay Location(6), Test ID(7), Employee(8), Roster Des(9), Activity(10),
-      //          Emp Start Time(11), Emp End Time(12), Read Code(13), Read Time(14)
-      
-      for (let i = 1; i < rows.length; i++) {
+    const { format, rowIndex, columns } = headerInfo;
+    console.log(`[IOCS] Sheet ${sheetName}: detected ${format} header at row ${rowIndex + 1}`);
+
+    if (format === 'Utah') {
+      for (let i = rowIndex + 1; i < rows.length; i++) {
         const row = rows[i];
         if (!row || row.length === 0) continue;
         
-        const techName = String(row[0] || '').trim().toUpperCase();
-        const testDate = row[1];
-        const financeNo = String(row[3] || '');
-        const office = String(row[5] || '').trim();
-        const testId = String(row[7] || '');
-        const employeeName = String(row[8] || '').trim();
-        const rosterDes = String(row[9] || '').trim();
-        const empStartTime = row[11];
-        const empEndTime = row[12];
-        const readTime = row[14];
+        const techName = String(getCell(row, columns.dct) || '').trim().toUpperCase();
+        const testDate = getCell(row, columns.date);
+        const financeNo = String(getCell(row, columns.finance) || '');
+        const office = String(getCell(row, columns.office) || '').trim();
+        const testId = String(getCell(row, columns.ein) || '');
+        const employeeName = String(getCell(row, columns.employee) || '').trim();
+        const rosterDes = String(getCell(row, columns.rd) || '').trim();
+        const empStartTime = getCell(row, columns.bt);
+        const empEndTime = getCell(row, columns.et);
+        const readTime = getCell(row, columns.rt);
         
-        if (!employeeName || !techName) continue;
+        if (!employeeName || !techName || !normalizeIocsDate(testDate)) continue;
         
         const entry = {
           weekSheet: sheetName,
@@ -518,31 +561,30 @@ function parseIocsExcel(bytes) {
       }
       
     } else {
-      // NEVADA FORMAT (existing logic)
-      for (let i = 2; i < rows.length; i++) {
+      for (let i = rowIndex + 1; i < rows.length; i++) {
         const row = rows[i];
-        if (!row || !row[1]) continue;
+        if (!row || row.length === 0) continue;
 
-        const assignedDct = String(row[11] || '').trim().toUpperCase();
+        const assignedDct = String(getCell(row, columns.dct) || '').trim().toUpperCase();
         if (!assignedDct || assignedDct === 'ASSIGNED DCT') continue;
         if (!/^[A-Z][A-Z\s.\-]*[A-Z]$/.test(assignedDct)) continue;
         if (!assignedDct.includes(' ') && assignedDct.length < 2) continue;
 
-        const rawDate = String(row[1] || '').trim();
+        const rawDate = String(getCell(row, columns.date) || '').trim();
         if (!/\d/.test(rawDate)) continue;
 
-        const location = String(row[3] || '').trim();
+        const location = String(getCell(row, columns.office) || '').trim();
         const entry = {
           weekSheet: sheetName,
-          date: normalizeIocsDate(row[1]),
-          financeCode: String(row[2] || ''),
+          date: normalizeIocsDate(getCell(row, columns.date)),
+          financeCode: String(getCell(row, columns.finance) || ''),
           location,
-          ein: String(row[4] || ''),
-          employeeName: String(row[5] || '').trim(),
-          rd: String(row[6] || '').trim(),
-          bt: String(row[7] || ''),
-          et: String(row[8] || ''),
-          rt: String(row[10] || ''),
+          ein: String(getCell(row, columns.ein) || ''),
+          employeeName: String(getCell(row, columns.employee) || '').trim(),
+          rd: String(getCell(row, columns.rd) || '').trim(),
+          bt: String(getCell(row, columns.bt) || ''),
+          et: String(getCell(row, columns.et) || ''),
+          rt: String(getCell(row, columns.rt) || ''),
           dct: assignedDct,
           state: 'Nevada'
         };
