@@ -653,16 +653,23 @@ async function processIocsFile(fileName, bytes, accessToken) {
 
   await runBatchedWrites(accessToken, docsToDelete, creates, 'IOCS');
 
+  const metaFields = {
+    iocsUpdatedAt: { timestampValue: new Date().toISOString() },
+    iocsCount: { integerValue: iocsEntries.length.toString() },
+    iocsFilename: { stringValue: fileName }
+  };
+  for (const state of statesInFile) {
+    const stateKey = state.toLowerCase();
+    const stateCount = iocsEntries.filter(entry => entry.state === state).length;
+    metaFields[`${stateKey}IocsUpdatedAt`] = { timestampValue: new Date().toISOString() };
+    metaFields[`${stateKey}IocsCount`] = { integerValue: stateCount.toString() };
+    metaFields[`${stateKey}IocsFilename`] = { stringValue: fileName };
+  }
+
   await fetch(`https://firestore.googleapis.com/v1/projects/${PROJECT_ID}/databases/(default)/documents/schedule/current`, {
     method: 'PATCH',
     headers: { 'Authorization': `Bearer ${accessToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      fields: {
-        iocsUpdatedAt: { timestampValue: new Date().toISOString() },
-        iocsCount: { integerValue: iocsEntries.length.toString() },
-        iocsFilename: { stringValue: fileName }
-      }
-    })
+    body: JSON.stringify({ fields: metaFields })
   });
 
   return { fileName, kind: 'iocs', count: iocsEntries.length, states: statesInFile, status: 'success' };
@@ -778,33 +785,38 @@ function getMimeBoundary(contentType) {
 }
 
 function extractExcelAttachments(rawEmail, boundary) {
-  const candidates = [];
-  const seen = new Set();
   const topLevelParts = boundary ? rawEmail.split(`--${boundary}`) : [];
   const anyBoundaryParts = rawEmail.split(/\r?\n--[^\r\n]+(?:--)?\r?\n/g);
 
-  for (const part of [...topLevelParts, ...anyBoundaryParts]) {
-    const fileName = extractAttachmentFileName(part);
-    if (!/\.(xlsx|xls)$/i.test(fileName)) continue;
+  const collectFromParts = (parts) => {
+    const candidates = [];
+    const seen = new Set();
 
-    const contentType = getPartHeader(part, 'content-type').toLowerCase();
-    const disposition = getPartHeader(part, 'content-disposition').toLowerCase();
-    const transferEncoding = getPartHeader(part, 'content-transfer-encoding').toLowerCase();
-    const isSpreadsheet =
-      contentType.includes('spreadsheet') ||
-      contentType.includes('excel') ||
-      contentType.includes('octet-stream') ||
-      /\.(xlsx|xls)$/i.test(fileName);
+    for (const part of parts) {
+      const fileName = extractAttachmentFileName(part);
+      if (!/\.(xlsx|xls)$/i.test(fileName)) continue;
 
-    if (!isSpreadsheet) continue;
+      const contentType = getPartHeader(part, 'content-type').toLowerCase();
+      const disposition = getPartHeader(part, 'content-disposition').toLowerCase();
+      const transferEncoding = getPartHeader(part, 'content-transfer-encoding').toLowerCase();
+      const isSpreadsheet =
+        contentType.includes('spreadsheet') ||
+        contentType.includes('excel') ||
+        contentType.includes('octet-stream') ||
+        /\.(xlsx|xls)$/i.test(fileName);
 
-    const key = `${fileName}:${part.length}:${transferEncoding}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    candidates.push({ part, fileName, disposition: disposition || '(none)' });
-  }
+      if (!isSpreadsheet) continue;
 
-  return candidates;
+      const key = `${fileName}:${part.length}:${transferEncoding}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      candidates.push({ part, fileName, disposition: disposition || '(none)' });
+    }
+    return candidates;
+  };
+
+  const exactMatches = collectFromParts(topLevelParts);
+  return exactMatches.length > 0 ? exactMatches : collectFromParts(anyBoundaryParts);
 }
 
 // ─── Main handler ───────────────────────────────────────────────────
