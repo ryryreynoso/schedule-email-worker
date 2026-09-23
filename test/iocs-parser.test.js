@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import test from 'node:test';
 import * as XLSX from 'xlsx';
 
-import { parseIocsExcel } from '../src/index.js';
+import { classifyWorkbook, parseIocsExcel } from '../src/index.js';
 
 const workbookPath = process.env.IOCS_TEST_WORKBOOK;
 
@@ -23,6 +23,37 @@ test('Utah date and similarly named columns map to the correct values', () => {
   assert.equal(entries[0].location, 'SAL-MURRAY BRUT');
   assert.equal(entries[0].bt, '00:00');
   assert.equal(entries[0].rt, '02:37');
+});
+
+test('quarterly schedule filenames win over IOCS-like TEST DAY text', () => {
+  const workbook = XLSX.utils.book_new();
+  const sheet = XLSX.utils.aoa_to_sheet([
+    ['TEST DAY'],
+    ['TEST SCHEDULE'],
+    ['ZIP CODES', 'ZIP', 'SITE', 'TYPE', 'TEST ID', 'TECH(S)'],
+    ['MONDAY 9-21-26'],
+    ['FLAT STREAM', '89101', 'LAS VEGAS', 'ODIS', '123456', 'RR']
+  ]);
+  XLSX.utils.book_append_sheet(workbook, sheet, 'Qtr 4');
+
+  assert.deepEqual(classifyWorkbook(workbook, '2026 Qtr 4 Schedule NV addd.xlsx'), {
+    kind: 'schedule',
+    state: 'Nevada'
+  });
+  assert.deepEqual(classifyWorkbook(workbook, 'addd UT.xlsx'), {
+    kind: 'schedule',
+    state: 'Utah'
+  });
+});
+
+test('IOCS filename remains authoritative', () => {
+  const workbook = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ['TEST SCHEDULE'],
+    ['MONDAY 9-21-26']
+  ]), 'Monday');
+
+  assert.deepEqual(classifyWorkbook(workbook, 'Copy of DAILY IOCS NV.xlsx'), { kind: 'iocs' });
 });
 
 test('exact Utah weekly master parses every assigned reading', { skip: !workbookPath }, () => {

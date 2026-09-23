@@ -198,12 +198,43 @@ function detectStateFromFileName(fileName) {
   return null;
 }
 
-function classifyWorkbook(workbook, fileName) {
+function workbookLooksLikeSchedule(workbook) {
+  for (const sheetName of workbook.SheetNames) {
+    if (sheetLooksBlank(sheetName)) continue;
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    let hasDatedDay = false;
+    let hasScheduleHeader = false;
+
+    for (let i = 0; i < Math.min(80, rows.length); i++) {
+      const cells = (rows[i] || []).map(cell => String(cell || '').trim().toUpperCase());
+      const firstCell = cells[0] || '';
+      const rowText = cells.join('|');
+
+      if (/^(MON|TUE|WED|THU|FRI|SAT|SUN)/.test(firstCell) && /\d{1,2}-\d{1,2}-\d{2,4}/.test(firstCell)) {
+        hasDatedDay = true;
+      }
+      if (firstCell === 'TEST SCHEDULE' || (rowText.includes('ZIP CODES') && rowText.includes('TECH(S)'))) {
+        hasScheduleHeader = true;
+      }
+    }
+
+    if (hasDatedDay || hasScheduleHeader) return true;
+  }
+  return false;
+}
+
+export function classifyWorkbook(workbook, fileName) {
   const fn = fileName.toLowerCase();
 
   // Filename-based IOCS detection
   if (fn.includes('iocs') || fn.includes('daily_iocs') || fn.includes('daily iocs')) {
     return { kind: 'iocs' };
+  }
+
+  const detectedState = detectStateFromFileName(fileName);
+  if (detectedState && (fn.includes('schedule') || workbookLooksLikeSchedule(workbook))) {
+    return { kind: 'schedule', state: detectedState };
   }
 
   // Content-based IOCS detection: sheets with "ASSIGNED DCT" or "TEST DAY" header.
@@ -227,7 +258,6 @@ function classifyWorkbook(workbook, fileName) {
   if (looksLikeIocs) return { kind: 'iocs' };
 
   // Schedule file — determine state
-  const detectedState = detectStateFromFileName(fileName);
   if (!detectedState) {
     throw new Error(`Could not detect schedule state from filename "${fileName}". Include UT/Utah or NV/Nevada in the filename.`);
   }
