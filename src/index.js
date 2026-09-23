@@ -495,7 +495,10 @@ function findHeaderColumn(headers, exactAliases, containsAliases = []) {
 }
 
 function findIocsHeader(rows) {
-  const maxRowsToScan = Math.min(rows.length, 25);
+  // Active-week exports can contain a large instruction/title block before
+  // the table. Historical sheets usually start near the top, which previously
+  // hid this problem by parsing every week except the current one.
+  const maxRowsToScan = Math.min(rows.length, 120);
 
   for (let rowIndex = 0; rowIndex < maxRowsToScan; rowIndex++) {
     const row = rows[rowIndex] || [];
@@ -556,13 +559,25 @@ export function parseIocsExcel(bytes) {
   const workbook = XLSX.read(bytes, { type: 'array' });
   const allEntries = [];
 
-  for (const sheetName of workbook.SheetNames) {
-    if (sheetLooksBlank(sheetName)) continue;
+  const sheetData = workbook.SheetNames
+    .filter(sheetName => !sheetLooksBlank(sheetName))
+    .map(sheetName => {
+      const sheet = workbook.Sheets[sheetName];
+      const displayRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+      const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
+      return { sheetName, displayRows, rawRows, headerInfo: findIocsHeader(displayRows) };
+    });
 
-    const sheet = workbook.Sheets[sheetName];
-    const displayRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
-    const rawRows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: true });
-    const headerInfo = findIocsHeader(displayRows);
+  // Weekly tabs in the same workbook use the same columns. If one tab omits
+  // or moves its visible header, reuse a schema discovered from a sibling tab
+  // and scan all rows. Row validation below prevents instruction sheets from
+  // becoming IOCS entries.
+  const fallbackHeader = sheetData.find(item => item.headerInfo)?.headerInfo || null;
+
+  for (const { sheetName, displayRows, rawRows, headerInfo: detectedHeader } of sheetData) {
+    const headerInfo = detectedHeader || (fallbackHeader
+      ? { ...fallbackHeader, rowIndex: -1, reusedFromSibling: true }
+      : null);
 
     if (!headerInfo) {
       console.log(`[IOCS] Sheet ${sheetName}: no IOCS header found`);
@@ -571,7 +586,9 @@ export function parseIocsExcel(bytes) {
 
     let rowsInSheet = 0;
     const { format, rowIndex, columns } = headerInfo;
-    console.log(`[IOCS] Sheet ${sheetName}: detected ${format} header at row ${rowIndex + 1}`);
+    console.log(headerInfo.reusedFromSibling
+      ? `[IOCS] Sheet ${sheetName}: reusing ${format} column layout from sibling sheet`
+      : `[IOCS] Sheet ${sheetName}: detected ${format} header at row ${rowIndex + 1}`);
 
     if (format === 'Utah') {
       // Utah workbooks format the date cells as weekday names. Read the raw

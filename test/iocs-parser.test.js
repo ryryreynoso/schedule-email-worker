@@ -56,6 +56,26 @@ test('IOCS filename remains authoritative', () => {
   assert.deepEqual(classifyWorkbook(workbook, 'Copy of DAILY IOCS NV.xlsx'), { kind: 'iocs' });
 });
 
+test('IOCS parser keeps the active week when its header is deep or omitted', () => {
+  const workbook = XLSX.utils.book_new();
+  const header = ['TEST DATE', 'FINANCE', 'OFFICE', 'EIN', 'EMPLOYEE', 'ROSTER DES', 'BT', 'ET', 'RT', 'ASSIGNED DCT'];
+  const deepRows = Array.from({ length: 40 }, () => ['']);
+  deepRows.push(header);
+  deepRows.push(['09/23/2026', '314881', 'LAS VEGAS NV NV', '04771924', 'D M LABAYAN-ARVEL', 'MAILHANDLER', '23:00', '7:30', '1:36', 'REYNOSO RYAN']);
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet(deepRows), '09-19-26');
+
+  // A sibling weekly tab can contain rows without repeating the visible
+  // header. It should inherit the proven column layout from the workbook.
+  XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([
+    ['09/26/2026', '314895', 'LAS-RED ROCK NV', '04436251', 'J E MCKENZIE', 'CLERK', '3:00', '12:00', '5:06', 'AGRESOR GRACE']
+  ]), '09-26-26');
+
+  const entries = parseIocsExcel(XLSX.write(workbook, { type: 'array', bookType: 'xlsx' }));
+  assert.equal(entries.length, 2);
+  assert.deepEqual(entries.map(entry => entry.date), ['2026-09-23', '2026-09-26']);
+  assert.deepEqual(entries.map(entry => entry.dct), ['REYNOSO RYAN', 'AGRESOR GRACE']);
+});
+
 test('exact Utah weekly master parses every assigned reading', { skip: !workbookPath }, () => {
   const entries = parseIocsExcel(fs.readFileSync(workbookPath));
 
